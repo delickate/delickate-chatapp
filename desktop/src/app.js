@@ -540,12 +540,12 @@ function renderCallOverlay() {
           <h2 id="call-title">${escapeHtml(incoming ? 'Incoming call' : call.phase === 'ringing' ? 'Calling…' : 'In call')}</h2>
           <p>${escapeHtml(call.peerName)} · ${video ? 'Video call' : 'Voice call'}</p>
         </div>
-        <span class="call-status">${escapeHtml(call.phase === 'active' ? 'Connected' : call.phase === 'connecting' ? 'Connecting…' : incoming ? 'Ringing' : 'Waiting')}</span>
+        <span class="call-status">${escapeHtml(call.connectionStatus || (call.phase === 'active' ? 'Connected' : call.phase === 'connecting' ? 'Connecting…' : incoming ? 'Ringing' : 'Waiting'))}</span>
       </header>
       ${video ? `<div class="call-video-grid">
-        <video id="call-remote-video" autoplay playsinline></video>
+        <video id="call-remote-video" autoplay controls playsinline></video>
         <video id="call-local-video" autoplay muted playsinline></video>
-      </div>` : '<div class="call-avatar" aria-hidden="true">☎</div><audio id="call-remote-audio" autoplay></audio>'}
+      </div>` : '<div class="call-avatar" aria-hidden="true">☎</div><audio id="call-remote-audio" autoplay controls></audio>'}
       <footer class="call-controls">
         ${incoming
           ? `<button class="call-control accept" data-call-action="accept">Answer</button><button class="call-control hangup" data-call-action="reject">Decline</button>`
@@ -558,9 +558,23 @@ function renderCallOverlay() {
   const localVideo = overlay.querySelector('#call-local-video');
   if (localVideo && state.localStream) localVideo.srcObject = state.localStream;
   const remoteVideo = overlay.querySelector('#call-remote-video');
-  if (remoteVideo && state.remoteStream) remoteVideo.srcObject = state.remoteStream;
+  if (remoteVideo && state.remoteStream) {
+    remoteVideo.srcObject = state.remoteStream;
+    playRemoteMedia(remoteVideo);
+  }
   const remoteAudio = overlay.querySelector('#call-remote-audio');
-  if (remoteAudio && state.remoteStream) remoteAudio.srcObject = state.remoteStream;
+  if (remoteAudio && state.remoteStream) {
+    remoteAudio.srcObject = state.remoteStream;
+    playRemoteMedia(remoteAudio);
+  }
+}
+
+function playRemoteMedia(element) {
+  element.play().catch((error) => {
+    if (error.name === 'AbortError' || !state.call || state.call.playbackWarningShown) return;
+    state.call.playbackWarningShown = true;
+    showNotice('Incoming media could not start automatically. Press Play in the call controls to hear or see your friend.');
+  });
 }
 
 function renderMessages() {
@@ -768,6 +782,8 @@ async function startCall(mediaType) {
     phase: 'ringing',
     muted: false,
     cameraEnabled: true,
+    playbackWarningShown: false,
+    connectionStatus: '',
   };
   state.call = call;
   renderCallOverlay();
@@ -803,8 +819,15 @@ async function createPeerConnection(call, initiator) {
       });
     }
   };
-  peer.ontrack = ({ streams }) => {
-    state.remoteStream = streams[0] || state.remoteStream;
+  peer.ontrack = ({ streams, track }) => {
+    if (streams[0]) {
+      state.remoteStream = streams[0];
+    } else {
+      state.remoteStream ||= new MediaStream();
+      if (!state.remoteStream.getTracks().some((item) => item.id === track.id)) {
+        state.remoteStream.addTrack(track);
+      }
+    }
     renderCallOverlay();
   };
   peer.onconnectionstatechange = () => {
@@ -812,7 +835,20 @@ async function createPeerConnection(call, initiator) {
     if (peer.connectionState === 'connected') updateCall({ phase: 'active' });
     if (peer.connectionState === 'failed') {
       void sendCallEvent('call:end', { call_id: call.id });
-      stopCall('The call connection failed. Check your network and try again.');
+      stopCall('The call could not connect. Check your network, then configure a TURN relay on the call server if either network blocks peer-to-peer connections.');
+    }
+  };
+  peer.oniceconnectionstatechange = () => {
+    if (state.call?.id !== call.id) return;
+    if (peer.iceConnectionState === 'checking') {
+      updateCall({ phase: 'connecting', connectionStatus: 'Connecting media…' });
+    } else if (peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed') {
+      updateCall({ phase: 'active', connectionStatus: '' });
+    } else if (peer.iceConnectionState === 'disconnected') {
+      updateCall({ connectionStatus: 'Reconnecting media…' });
+    } else if (peer.iceConnectionState === 'failed') {
+      void sendCallEvent('call:end', { call_id: call.id });
+      stopCall('Video could not reach the other device. Configure a TURN relay on the call server and try again.');
     }
   };
   updateCall({ phase: 'connecting' });
@@ -914,6 +950,8 @@ async function handleCallSocketEvent(event, payload) {
       phase: 'ringing',
       muted: false,
       cameraEnabled: true,
+      playbackWarningShown: false,
+      connectionStatus: '',
     };
     renderCallOverlay();
   } else if (!call || payload?.call_id !== call.id) {
