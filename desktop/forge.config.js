@@ -1,15 +1,32 @@
 const { FusesPlugin } = require('@electron-forge/plugin-fuses');
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 
+const windowsCertificatePath = process.env.WINDOWS_CERT_PATH;
+const windowsCertificatePassword = process.env.WINDOWS_CERT_PASSWORD;
+const windowsSignParams = process.env.WINDOWS_SIGN_PARAMS || '/fd SHA256 /tr http://timestamp.digicert.com /td sha256';
+
+const squirrelSigningConfig = windowsCertificatePath
+  ? {
+      certificateFile: windowsCertificatePath,
+      certificatePassword: windowsCertificatePassword || '',
+      signWithParams: windowsSignParams,
+    }
+  : {};
+
 module.exports = {
   packagerConfig: {
     asar: true,
+    executableName: 'Daylight Chat',
   },
   rebuildConfig: {},
   makers: [
     {
       name: '@electron-forge/maker-squirrel',
-      config: {},
+      config: {
+        ...squirrelSigningConfig,
+        setupExe: 'DaylightChatSetup.exe',
+        setupIcon: undefined,
+      },
     },
     {
       name: '@electron-forge/maker-zip',
@@ -29,8 +46,6 @@ module.exports = {
       name: '@electron-forge/plugin-auto-unpack-natives',
       config: {},
     },
-    // Fuses are used to enable/disable various Electron functionality
-    // at package time, before code signing the application
     new FusesPlugin({
       version: FuseVersion.V1,
       [FuseV1Options.RunAsNode]: false,
