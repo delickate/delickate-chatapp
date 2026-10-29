@@ -60,3 +60,7 @@ contextBridge.exposeInMainWorld('localAttachments', {
   saveImage: (attachment) => ipcRenderer.invoke('chat:attachment-save', attachment),
   readImage: (attachment) => ipcRenderer.invoke('chat:attachment-read', attachment),
 });
+
+contextBridge.exposeInMainWorld('desktopApp', {
+  setUnreadCount: (count, notify) => ipcRenderer.send('chat:unread-count', { count, notify }),
+});

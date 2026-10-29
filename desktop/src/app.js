@@ -8,8 +8,25 @@ const DEFAULT_API_URL = 'https://api.sanjakarobar.com/api';
 const DEFAULT_SOCKET_URL = 'https://socket.sanjakarobar.com';
 const REFRESH_INTERVAL = 5000;
 const MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024;
-const CACHED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+const ALLOWED_ATTACHMENT_EXTENSIONS = new Set([
+  'jpg', 'jpeg', 'jpe', 'jfif', 'png', 'gif', 'webp', 'bmp', 'dib', 'tif', 'tiff', 'ico', 'avif', 'heic', 'heif',
+  'pdf', 'txt', 'rtf', 'doc', 'dot', 'docx', 'docm', 'dotx', 'dotm', 'odt',
+  'ppt', 'pot', 'pps', 'pptx', 'pptm', 'ppsx', 'odp',
+  'xls', 'xlt', 'xlsx', 'xlsm', 'xlsb', 'xltx', 'xltm', 'csv', 'ods', 'zip',
+]);
+const CACHED_IMAGE_TYPES = new Set([
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp', 'image/avif',
+]);
 const TYPING_TIMEOUT = 1400;
+const EMOJI_OPTIONS = [
+  ['😀', 'Grinning face'], ['😂', 'Face with tears of joy'], ['🥰', 'Smiling face with hearts'],
+  ['😊', 'Smiling face'], ['😍', 'Heart eyes'], ['😎', 'Sunglasses face'], ['😭', 'Loudly crying face'],
+  ['😮', 'Face with open mouth'], ['🤔', 'Thinking face'], ['😘', 'Face blowing a kiss'],
+  ['😢', 'Crying face'], ['😡', 'Angry face'], ['👋', 'Waving hand'], ['👏', 'Clapping hands'],
+  ['🙌', 'Raising hands'], ['🙏', 'Folded hands'], ['👍', 'Thumbs up'], ['👎', 'Thumbs down'],
+  ['❤️', 'Red heart'], ['💕', 'Two hearts'], ['💯', 'Hundred points'], ['🎉', 'Party popper'],
+  ['🔥', 'Fire'], ['✨', 'Sparkles'], ['✅', 'Check mark'], ['🌹', 'Rose'],
+];
 const app = document.querySelector('#app');
 
 const state = {
@@ -21,9 +38,11 @@ const state = {
   friends: [],
   requests: [],
   conversations: [],
+  unreadCount: null,
   selectedConversationId: null,
   messages: [],
   selectedAttachment: null,
+  attachmentPreviewUrl: null,
   cachedAttachments: new Map(),
   attachmentCachePending: new Set(),
   onlineFriendIds: new Set(),
@@ -264,8 +283,11 @@ function clearSession() {
   state.friends = [];
   state.requests = [];
   state.conversations = [];
+  state.unreadCount = null;
+  window.desktopApp?.setUnreadCount(0, false);
   state.messages = [];
   state.selectedAttachment = null;
+  clearAttachmentPreview();
   state.cachedAttachments.clear();
   state.attachmentCachePending.clear();
   state.selectedConversationId = null;
@@ -388,7 +410,7 @@ function showChatShell() {
       </aside>
       <section class="panel">
         <div class="panel-top">
-          <h2>Messages</h2>
+          <h2>Messages <span class="unread-total" id="unread-message-count" hidden></span></h2>
           <p>Your conversations with friends.</p>
           <label class="search-box"><span aria-hidden="true">⌕</span><input id="conversation-search" type="search" placeholder="Search conversations" aria-label="Search conversations" /></label>
         </div>
@@ -400,6 +422,7 @@ function showChatShell() {
   renderSidebar();
   renderConversationList();
   renderThread();
+  syncUnreadIndicators();
 }
 
 function renderSidebar() {
@@ -440,7 +463,7 @@ function renderConversationList() {
 
   list.innerHTML = conversations.length
     ? conversations.map((conversation) => `
-      <button class="conversation-item ${String(conversation.id) === String(state.selectedConversationId) ? 'active' : ''}" type="button" data-action="select-conversation" data-id="${escapeHtml(conversation.id)}">
+      <button class="conversation-item ${String(conversation.id) === String(state.selectedConversationId) ? 'active' : ''} ${Number(conversation.unread_count) > 0 ? 'has-unread' : ''}" type="button" data-action="select-conversation" data-id="${escapeHtml(conversation.id)}">
         ${friendAvatar(conversation.friend, 'lg', true)}
         <span class="person-info">
           <span class="person-name">${escapeHtml(conversation.friend?.name)}</span>
@@ -479,13 +502,20 @@ function renderThread() {
     </header>
     <div class="message-list" id="message-list"></div>
     <div class="composer-wrap">
+      <div class="attachment-preview" id="attachment-preview" aria-live="polite" hidden></div>
       <form class="composer" id="message-form">
         <textarea class="compose-input" name="body" rows="1" maxlength="10000" placeholder="Write a message…" aria-label="Write a message"></textarea>
-        <input id="attachment-input" type="file" accept=".jpg,.jpeg,.png,.gif,.webp,.pdf,.txt" hidden>
+        <div class="emoji-picker" id="emoji-picker" role="group" aria-label="Choose an emoji" hidden>
+          ${EMOJI_OPTIONS.map(([emoji, label]) => `
+            <button type="button" class="emoji-option" data-action="insert-emoji" data-emoji="${emoji}" aria-label="${label}" title="${label}">${emoji}</button>
+          `).join('')}
+        </div>
+        <button class="emoji-button" type="button" data-action="toggle-emoji-picker" aria-label="Add emoji" aria-expanded="false" aria-controls="emoji-picker" title="Add emoji">☺</button>
+        <input id="attachment-input" type="file" accept="image/*,.pdf,.txt,.rtf,.doc,.dot,.docx,.docm,.dotx,.dotm,.odt,.ppt,.pot,.pps,.pptx,.pptm,.ppsx,.odp,.xls,.xlt,.xlsx,.xlsm,.xlsb,.xltx,.xltm,.csv,.ods,.zip" hidden>
         <button class="attach-button" type="button" data-action="choose-attachment" aria-label="Attach a file" title="Attach a file">＋</button>
         <button class="send-button" type="submit" aria-label="Send message">➤</button>
       </form>
-      <p class="composer-hint" id="attachment-status" aria-live="polite">Press Enter to send · Shift + Enter for a new line. Attachments: 5 MiB max.</p>
+      <p class="composer-hint" id="attachment-status" aria-live="polite">Press Enter to send · Shift + Enter for a new line. Images, documents, spreadsheets, and ZIP files · 5 MiB max.</p>
     </div>`;
   renderMessages();
 }
@@ -571,6 +601,23 @@ function renderMessages() {
   if (wasNearBottom) list.scrollTop = list.scrollHeight;
 }
 
+function syncUnreadIndicators() {
+  const unreadCount = state.conversations.reduce((total, conversation) => {
+    const count = Number(conversation.unread_count);
+    return total + (Number.isSafeInteger(count) && count > 0 ? count : 0);
+  }, 0);
+  const shouldNotify = state.unreadCount !== null && unreadCount > state.unreadCount;
+  state.unreadCount = unreadCount;
+
+  const unreadLabel = document.querySelector('#unread-message-count');
+  if (unreadLabel) {
+    unreadLabel.textContent = `${unreadCount} unread`;
+    unreadLabel.hidden = unreadCount === 0;
+  }
+  document.title = unreadCount ? `(${unreadCount}) Delickate — Messages` : 'Delickate — Messages';
+  window.desktopApp?.setUnreadCount(unreadCount, shouldNotify);
+}
+
 function formatFileSize(size) {
   const bytes = Number(size) || 0;
   return bytes < 1024 * 1024
@@ -586,11 +633,14 @@ async function loadMessages({ markRead = true } = {}) {
   }
   const payload = await api(`/conversations/${encodeURIComponent(conversation.id)}/messages`);
   state.messages = Array.isArray(payload.data) ? payload.data : [];
-  if (markRead && state.messages.some((message) =>
+  if (markRead && document.hasFocus() && state.messages.some((message) =>
     String(message.sender?.id) !== String(state.user.id) && !message.read_at)) {
     await api(`/conversations/${encodeURIComponent(conversation.id)}/read`, { method: 'POST' });
     state.messages = await api(`/conversations/${encodeURIComponent(conversation.id)}/messages`)
       .then((result) => Array.isArray(result.data) ? result.data : []);
+    conversation.unread_count = 0;
+    renderConversationList();
+    syncUnreadIndicators();
   }
   await cacheMessageImages(conversation.id, state.messages);
 }
@@ -607,6 +657,7 @@ async function refreshData() {
     state.friends = Array.isArray(friends.data) ? friends.data : [];
     state.requests = Array.isArray(requests.data) ? requests.data : [];
     state.conversations = Array.isArray(conversations.data) ? conversations.data : [];
+    syncUnreadIndicators();
     const friendSignature = state.friends.map((friend) => friend.id).sort().join(',');
     if (state.socketFriendSignature !== null && state.socketFriendSignature !== friendSignature) {
       connectSocket();
@@ -1037,6 +1088,8 @@ async function openFriend(friendId) {
   clearTypingIndicator();
   state.selectedConversationId = conversation.id;
   state.messages = [];
+  state.selectedAttachment = null;
+  clearAttachmentPreview();
   render();
   joinSelectedConversation();
   await loadMessages();
@@ -1088,6 +1141,9 @@ async function handleSendMessage(form) {
   const conversation = selectedConversation();
   const file = state.selectedAttachment;
   if (!conversation || (!body && !file)) return;
+  if (file && !isAllowedAttachment(file)) {
+    throw new Error('Choose an image, document, spreadsheet, or ZIP file.');
+  }
   if (file && file.size > MAX_ATTACHMENT_SIZE) {
     throw new Error('Attachments must be 5 MiB or smaller.');
   }
@@ -1108,6 +1164,7 @@ async function handleSendMessage(form) {
     state.selectedAttachment = null;
     const attachmentInput = form.querySelector('#attachment-input');
     if (attachmentInput) attachmentInput.value = '';
+    clearAttachmentPreview();
     updateAttachmentStatus();
     if (file && CACHED_IMAGE_TYPES.has(sentMessage.attachment?.mime)) {
       try {
@@ -1135,9 +1192,107 @@ function updateAttachmentStatus() {
   const status = document.querySelector('#attachment-status');
   if (status) {
     status.textContent = state.selectedAttachment
-      ? `${state.selectedAttachment.name} · ${formatFileSize(state.selectedAttachment.size)} (5 MiB max)`
-      : 'Press Enter to send · Shift + Enter for a new line. Attachments: 5 MiB max.';
+      ? 'Ready to send · 5 MiB max.'
+      : 'Press Enter to send · Shift + Enter for a new line. Images, documents, spreadsheets, and ZIP files · 5 MiB max.';
   }
+}
+
+function clearAttachmentPreview() {
+  if (state.attachmentPreviewUrl) {
+    URL.revokeObjectURL(state.attachmentPreviewUrl);
+    state.attachmentPreviewUrl = null;
+  }
+  const preview = document.querySelector('#attachment-preview');
+  if (preview) {
+    preview.replaceChildren();
+    preview.hidden = true;
+  }
+}
+
+function renderAttachmentPreview(file) {
+  clearAttachmentPreview();
+  if (!file) return;
+  const preview = document.querySelector('#attachment-preview');
+  if (!preview) return;
+
+  const details = document.createElement('div');
+  details.className = 'attachment-preview-details';
+  const extension = file.name.split('.').pop()?.toUpperCase() || 'FILE';
+  const imageTypes = new Set([
+    'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp', 'image/avif',
+  ]);
+  if (imageTypes.has(file.type)) {
+    state.attachmentPreviewUrl = URL.createObjectURL(file);
+    const image = document.createElement('img');
+    image.className = 'attachment-preview-image';
+    image.src = state.attachmentPreviewUrl;
+    image.alt = `Preview of ${file.name}`;
+    details.append(image);
+  } else {
+    const icon = document.createElement('span');
+    icon.className = 'attachment-preview-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.textContent = extension.slice(0, 4);
+    details.append(icon);
+  }
+
+  const description = document.createElement('span');
+  description.className = 'attachment-preview-description';
+  const filename = document.createElement('span');
+  filename.className = 'attachment-preview-name';
+  filename.textContent = file.name;
+  const metadata = document.createElement('span');
+  metadata.className = 'attachment-preview-size';
+  metadata.textContent = `${formatFileSize(file.size)} · ${extension}`;
+  description.append(filename, metadata);
+  details.append(description);
+
+  const remove = document.createElement('button');
+  remove.className = 'attachment-preview-remove';
+  remove.type = 'button';
+  remove.dataset.action = 'remove-attachment';
+  remove.setAttribute('aria-label', 'Remove attachment');
+  remove.title = 'Remove attachment';
+  remove.textContent = '×';
+  preview.append(details, remove);
+  preview.hidden = false;
+}
+
+function isAllowedAttachment(file) {
+  const extension = file.name.split('.').pop()?.toLowerCase();
+  return Boolean(extension && ALLOWED_ATTACHMENT_EXTENSIONS.has(extension));
+}
+
+function toggleEmojiPicker() {
+  const picker = document.querySelector('#emoji-picker');
+  const button = document.querySelector('[data-action="toggle-emoji-picker"]');
+  if (!picker || !button) return;
+  picker.hidden = !picker.hidden;
+  button.setAttribute('aria-expanded', String(!picker.hidden));
+}
+
+function closeEmojiPicker() {
+  const picker = document.querySelector('#emoji-picker');
+  const button = document.querySelector('[data-action="toggle-emoji-picker"]');
+  if (!picker || !button) return;
+  picker.hidden = true;
+  button.setAttribute('aria-expanded', 'false');
+}
+
+function insertEmoji(emoji) {
+  const field = document.querySelector('#message-form textarea');
+  if (!field) return;
+  const start = field.selectionStart;
+  const end = field.selectionEnd;
+  const nextValue = `${field.value.slice(0, start)}${emoji}${field.value.slice(end)}`;
+  if (nextValue.length > field.maxLength) {
+    showNotice('This message has reached the 10,000 character limit.');
+    return;
+  }
+  field.setRangeText(emoji, start, end, 'end');
+  field.focus();
+  field.dispatchEvent(new Event('input', { bubbles: true }));
+  closeEmojiPicker();
 }
 
 async function logout() {
@@ -1184,6 +1339,11 @@ app.addEventListener('submit', async (event) => {
 });
 
 app.addEventListener('click', async (event) => {
+  const picker = document.querySelector('#emoji-picker');
+  if (picker && !picker.hidden && !picker.contains(event.target) &&
+    !event.target.closest('[data-action="toggle-emoji-picker"]')) {
+    closeEmojiPicker();
+  }
   const button = event.target.closest('[data-action]');
   if (!button) return;
   const { action, id } = button.dataset;
@@ -1203,6 +1363,16 @@ app.addEventListener('click', async (event) => {
       await startCall(action === 'call-video' ? 'video' : 'audio');
     } else if (action === 'choose-attachment') {
       document.querySelector('#attachment-input')?.click();
+    } else if (action === 'remove-attachment') {
+      state.selectedAttachment = null;
+      const attachmentInput = document.querySelector('#attachment-input');
+      if (attachmentInput) attachmentInput.value = '';
+      clearAttachmentPreview();
+      updateAttachmentStatus();
+    } else if (action === 'toggle-emoji-picker') {
+      toggleEmojiPicker();
+    } else if (button.dataset.emoji) {
+      insertEmoji(button.dataset.emoji);
     } else if (action === 'download-attachment') {
       const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
       await downloadAttachment(message);
@@ -1221,6 +1391,9 @@ app.addEventListener('click', async (event) => {
       state.selectedConversationId = id;
       state.messages = [];
       state.selectedAttachment = null;
+      const attachmentInput = document.querySelector('#attachment-input');
+      if (attachmentInput) attachmentInput.value = '';
+      clearAttachmentPreview();
       renderThread();
       renderConversationList();
       joinSelectedConversation();
@@ -1256,6 +1429,13 @@ app.addEventListener('input', (event) => {
 app.addEventListener('change', (event) => {
   if (event.target.id !== 'attachment-input') return;
   const file = event.target.files?.[0] || null;
+  if (file && !isAllowedAttachment(file)) {
+    event.target.value = '';
+    state.selectedAttachment = null;
+    updateAttachmentStatus();
+    showNotice('Choose an image, document, spreadsheet, or ZIP file.');
+    return;
+  }
   if (file && file.size > MAX_ATTACHMENT_SIZE) {
     event.target.value = '';
     state.selectedAttachment = null;
@@ -1264,10 +1444,14 @@ app.addEventListener('change', (event) => {
     return;
   }
   state.selectedAttachment = file;
+  renderAttachmentPreview(file);
   updateAttachmentStatus();
 });
 
 app.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !document.querySelector('#emoji-picker')?.hidden) {
+    closeEmojiPicker();
+  }
   if (event.target.matches('#message-form textarea') && event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
     event.target.form.requestSubmit();

@@ -4,6 +4,7 @@ const path = require('node:path');
 const { io } = require('socket.io-client');
 
 const MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024;
+const WINDOW_TITLE = 'Delickate — Messages';
 const IMAGE_TYPES = {
   'image/jpeg': {
     extension: 'jpg',
@@ -23,6 +24,16 @@ const IMAGE_TYPES = {
     signature: (data) => data.length >= 12 &&
       data.subarray(0, 4).toString('ascii') === 'RIFF' &&
       data.subarray(8, 12).toString('ascii') === 'WEBP',
+  },
+  'image/bmp': {
+    extension: 'bmp',
+    signature: (data) => data.length >= 2 && data.subarray(0, 2).toString('ascii') === 'BM',
+  },
+  'image/avif': {
+    extension: 'avif',
+    signature: (data) => data.length >= 12 &&
+      data.subarray(4, 8).toString('ascii') === 'ftyp' &&
+      ['avif', 'avis'].includes(data.subarray(8, 12).toString('ascii')),
   },
 };
 
@@ -156,6 +167,21 @@ ipcMain.handle('chat:call-event', (_event, { event, payload } = {}) => {
   return true;
 });
 
+ipcMain.on('chat:unread-count', (event, { count, notify } = {}) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+  if (!Number.isSafeInteger(count) || count < 0 || typeof notify !== 'boolean') {
+    console.error('Ignoring invalid unread-message count from the renderer.');
+    return;
+  }
+
+  mainWindow.setTitle(count ? `(${count}) ${WINDOW_TITLE}` : WINDOW_TITLE);
+  if (count === 0 || mainWindow.isFocused()) {
+    mainWindow.flashFrame(false);
+  } else if (notify) {
+    mainWindow.flashFrame(true);
+  }
+});
+
 function attachmentCachePath(userId, conversationId, messageId, mime) {
   const user = Number(userId);
   const conversation = Number(conversationId);
@@ -239,6 +265,9 @@ const createWindow = () => {
 
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.on('focus', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.flashFrame(false);
+  });
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
