@@ -1,14 +1,14 @@
 {
   "name": "desktop",
-  "productName": "Daylight Chat",
-  "version": "1.0.0",
+  "productName": "PITBConnect",
+  "version": "1.0.1",
   "private": true,
-  "description": "Desktop messaging client for Daylight",
+  "description": "Desktop messaging client for PITBConnect",
   "keywords": [],
   "license": "MIT",
   "author": {
-    "name": "Humayun Shahzad",
-    "email": "humayun.shahzad@pitb.gov.pk"
+    "name": "Sani Hyne",
+    "email": "delickate@hotmail.com"
   },
   "main": "./src/index.js",
   "scripts": {

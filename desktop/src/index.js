@@ -1,10 +1,13 @@
-const { app, BrowserWindow, dialog, ipcMain, session } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, session, shell } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { io } = require('socket.io-client');
+const { version: APP_VERSION } = require('../package.json');
 
 const MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024;
-const WINDOW_TITLE = 'Delickate — Messages';
+const WINDOW_TITLE = 'PITBConnect — Messages';
+const RELEASES_API_URL = 'https://api.github.com/repos/delickate/delickate-chatapp/releases/latest';
+const RELEASES_DOWNLOAD_URL = 'https://github.com/delickate/delickate-chatapp/releases/download';
 const IMAGE_TYPES = {
   'image/jpeg': {
     extension: 'jpg',
@@ -70,6 +73,73 @@ const CALL_CLIENT_EVENTS = new Set([
 ]);
 let mainWindow;
 let socketClient;
+
+function parseVersion(value) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(value);
+  if (!match) {
+    throw new Error(`Invalid application version: ${value}`);
+  }
+  return match.slice(1).map(Number);
+}
+
+function isNewerVersion(candidate, current) {
+  const candidateParts = parseVersion(candidate);
+  const currentParts = parseVersion(current);
+  for (let index = 0; index < candidateParts.length; index += 1) {
+    if (candidateParts[index] !== currentParts[index]) {
+      return candidateParts[index] > currentParts[index];
+    }
+  }
+  return false;
+}
+
+function isMainWindowEvent(event) {
+  return Boolean(mainWindow && !mainWindow.isDestroyed() &&
+    event.sender === mainWindow.webContents);
+}
+
+ipcMain.handle('desktop:check-updates', async (event) => {
+  if (!isMainWindowEvent(event)) {
+    throw new Error('Update checks are only available to the app window.');
+  }
+
+  const response = await fetch(RELEASES_API_URL, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'PITBConnect-Desktop',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!response.ok) {
+    throw new Error(response.status === 404
+      ? 'No PITBConnect release has been published yet.'
+      : `GitHub update check failed (${response.status}).`);
+  }
+
+  const release = await response.json();
+  if (typeof release.tag_name !== 'string') {
+    throw new Error('The latest GitHub release does not have a valid version tag.');
+  }
+
+  const latestVersion = release.tag_name.replace(/^v/, '');
+  parseVersion(latestVersion);
+  return {
+    currentVersion: APP_VERSION,
+    latestVersion,
+    updateAvailable: isNewerVersion(latestVersion, APP_VERSION),
+  };
+});
+
+ipcMain.handle('desktop:download-update', (event, version) => {
+  if (!isMainWindowEvent(event)) {
+    throw new Error('Updates can only be downloaded by the app window.');
+  }
+  const [major, minor, patch] = parseVersion(version);
+  return shell.openExternal(
+    `${RELEASES_DOWNLOAD_URL}/v${major}.${minor}.${patch}/PITBConnectSetup.exe`,
+  );
+});
 
 function sendSocketEvent(event, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -290,7 +360,7 @@ app.whenReady().then(() => {
     dialog.showMessageBox(mainWindow, {
       type: 'question',
       title: 'Allow microphone and camera',
-      message: 'Daylight needs access to your microphone and camera for calls.',
+      message: 'PITBConnect needs access to your microphone and camera for calls.',
       buttons: ['Allow', 'Deny'],
       defaultId: 1,
       cancelId: 1,

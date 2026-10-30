@@ -1,4 +1,4 @@
-# Daylight Desktop
+# PITBConnect Desktop
 
 Electron desktop client for the Laravel chat API.
 
@@ -45,4 +45,31 @@ Calls use WebRTC peer-to-peer media and the Socket.IO service for authorized
 signaling. A TURN relay is recommended for reliable connections across mobile
 networks and restrictive firewalls.
 
-For packaging, use `npm run make` with Electron Forge.
+## Versioning and releases
+
+The desktop version is maintained in `package.json` and `package-lock.json`.
+Use semantic versions (`MAJOR.MINOR.PATCH`); from this folder, run
+`npm version patch --no-git-tag-version` for a bug-fix release, or use `minor`
+or `major` when appropriate. Commit the version change, then tag and push the
+matching version with a `v` prefix:
+
+```powershell
+npm version patch --no-git-tag-version
+$version = node -p "require('./package.json').version"
+git add package.json package-lock.json
+git commit -m "Release desktop v$version"
+git tag "v$version"
+git push origin HEAD
+git push origin "v$version"
+```
+
+This update sets the desktop version to `1.0.1`; after merging it, publish the
+first updater-enabled installer by pushing tag `v1.0.1`.
+
+The GitHub Actions release workflow builds the Windows installer and attaches
+it to a GitHub Release. The desktop app checks the latest published release on
+startup and provides a **Download** option when a newer version is available.
+The Windows installer is downloaded directly and run by the user; updates are
+not installed silently. Existing installations must first install a build
+containing the update checker; subsequent releases can be discovered in-app.
+For a local Windows build, use `npm run make`.

@@ -63,4 +63,6 @@ contextBridge.exposeInMainWorld('localAttachments', {
 
 contextBridge.exposeInMainWorld('desktopApp', {
   setUnreadCount: (count, notify) => ipcRenderer.send('chat:unread-count', { count, notify }),
+  checkForUpdates: () => ipcRenderer.invoke('desktop:check-updates'),
+  downloadUpdate: (version) => ipcRenderer.invoke('desktop:download-update', version),
 });

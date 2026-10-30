@@ -16,7 +16,7 @@ const squirrelSigningConfig = windowsCertificatePath
 module.exports = {
   packagerConfig: {
     asar: true,
-    executableName: 'Daylight Chat',
+    executableName: 'PITBConnect',
   },
   rebuildConfig: {},
   makers: [
@@ -24,7 +24,7 @@ module.exports = {
       name: '@electron-forge/maker-squirrel',
       config: {
         ...squirrelSigningConfig,
-        setupExe: 'DaylightChatSetup.exe',
+        setupExe: 'PITBConnectSetup.exe',
         setupIcon: undefined,
       },
     },

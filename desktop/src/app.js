@@ -1,9 +1,9 @@
 'use strict';
 
-const API_URL_KEY = 'daylight.apiUrl';
-const TOKEN_KEY = 'daylight.authToken';
-const USER_KEY = 'daylight.currentUser';
-const SOCKET_URL_KEY = 'daylight.socketUrl';
+const API_URL_KEY = 'pitbconnect.apiUrl';
+const TOKEN_KEY = 'pitbconnect.authToken';
+const USER_KEY = 'pitbconnect.currentUser';
+const SOCKET_URL_KEY = 'pitbconnect.socketUrl';
 const DEFAULT_API_URL = 'https://api.sanjakarobar.com/api';
 const DEFAULT_SOCKET_URL = 'https://socket.sanjakarobar.com';
 const REFRESH_INTERVAL = 5000;
@@ -30,9 +30,9 @@ const EMOJI_OPTIONS = [
 const app = document.querySelector('#app');
 
 const state = {
-  apiUrl: normalizeApiUrl(localStorage.getItem(API_URL_KEY) || DEFAULT_API_URL),
-  socketUrl: localStorage.getItem(SOCKET_URL_KEY) || DEFAULT_SOCKET_URL,
-  token: localStorage.getItem(TOKEN_KEY),
+  apiUrl: normalizeApiUrl(readStoredValue(API_URL_KEY, 'daylight.apiUrl') || DEFAULT_API_URL),
+  socketUrl: readStoredValue(SOCKET_URL_KEY, 'daylight.socketUrl') || DEFAULT_SOCKET_URL,
+  token: readStoredValue(TOKEN_KEY, 'daylight.authToken'),
   user: readStoredUser(),
   authMode: 'login',
   friends: [],
@@ -59,6 +59,9 @@ const state = {
   pollTimer: null,
   noticeTimer: null,
   lastRefreshError: '',
+  appVersion: '',
+  updateAvailableVersion: null,
+  updateStatus: 'Checking for updates…',
   call: null,
   peerConnection: null,
   localStream: null,
@@ -72,9 +75,20 @@ function normalizeApiUrl(value) {
   return value.trim().replace(/\/+$/, '');
 }
 
+function readStoredValue(key, legacyKey) {
+  const value = localStorage.getItem(key);
+  if (value !== null) return value;
+  const legacyValue = localStorage.getItem(legacyKey);
+  if (legacyValue !== null) {
+    localStorage.setItem(key, legacyValue);
+    localStorage.removeItem(legacyKey);
+  }
+  return legacyValue;
+}
+
 function readStoredUser() {
   try {
-    return JSON.parse(localStorage.getItem(USER_KEY) || 'null');
+    return JSON.parse(readStoredValue(USER_KEY, 'daylight.currentUser') || 'null');
   } catch {
     return null;
   }
@@ -319,7 +333,7 @@ function showAuth() {
     <section class="auth-screen">
       <div class="auth-card">
         <aside class="auth-aside">
-          <div class="brand-lockup"><span class="brand-mark">d</span><span>daylight</span></div>
+          <div class="brand-lockup"><span class="brand-mark">P</span><span>PITBConnect</span></div>
           <div class="aside-copy">
             <h1>Good conversations start here.</h1>
             <p>A quieter place to catch up with your people, one message at a time.</p>
@@ -342,7 +356,7 @@ function showAuth() {
             <button class="primary-button auth-submit" type="submit">${isSignup ? 'Create account' : 'Sign in'}</button>
           </form>
           <p class="switch-auth">
-            ${isSignup ? 'Already have an account?' : 'New to Daylight?'}
+            ${isSignup ? 'Already have an account?' : 'New to PITBConnect?'}
             <button class="text-button" type="button" data-action="toggle-auth">${isSignup ? 'Sign in' : 'Create account'}</button>
           </p>
           <details class="api-settings">
@@ -354,9 +368,22 @@ function showAuth() {
             </form>
             <div>API URL ends with <code>/api</code>; socket URL is the server origin.</div>
           </details>
+          ${updateControls()}
         </section>
       </div>
     </section>`;
+}
+
+function updateControls() {
+  return `
+    <div class="update-controls">
+      <span class="app-version" id="app-version">${state.appVersion ? `PITBConnect v${escapeHtml(state.appVersion)}` : 'PITBConnect'}</span>
+      <div class="update-actions">
+        <button class="small-button" type="button" data-action="check-updates">Check for updates</button>
+        <button class="small-button update-download" type="button" data-action="download-update" ${state.updateAvailableVersion ? '' : 'hidden'}>Download v${escapeHtml(state.updateAvailableVersion || '')}</button>
+      </div>
+      <span class="update-status" id="update-status" role="status" aria-live="polite">${escapeHtml(state.updateStatus)}</span>
+    </div>`;
 }
 
 function render() {
@@ -388,39 +415,32 @@ function conversationForFriend(friendId) {
 
 function showChatShell() {
   app.innerHTML = `
-    <div class="app-shell">
+    <div class="app-shell ${state.selectedConversationId ? 'chat-open' : ''}">
       <aside class="rail">
         <header class="rail-brand">
-          <div class="brand-lockup"><span class="brand-mark">d</span><span>daylight</span></div>
+          <div class="brand-lockup"><span class="brand-mark">P</span><span>PITBConnect</span></div>
           <button class="icon-button" type="button" data-action="refresh" title="Refresh" aria-label="Refresh">↻</button>
         </header>
         <div class="section-head"><h2>Friend requests</h2><span class="counter" id="request-count">0</span></div>
         <div class="request-list" id="request-list"></div>
-        <div class="section-head"><h2>Your friends</h2><span class="section-label">Phone</span></div>
+        <div class="section-head chats-head"><h2>Chats</h2><span class="unread-total" id="unread-message-count" hidden></span></div>
+        <label class="search-box friend-search"><span aria-hidden="true">⌕</span><input id="friend-search" type="search" placeholder="Search friends" aria-label="Search friends" /></label>
         <form class="add-friend" id="add-friend-form">
           <input name="phone" type="tel" inputmode="tel" pattern="\\+[1-9][0-9]{7,14}" placeholder="+1 555 123 4567" aria-label="Friend's phone number" required />
           <button type="submit" title="Send friend request" aria-label="Send friend request">+</button>
         </form>
         <div class="friend-list" id="friend-list"></div>
+        ${updateControls()}
         <div class="profile">
           ${friendAvatar(state.user, 'sm')}
           <div class="person-info"><div class="person-name">${escapeHtml(state.user.name)}</div><div class="person-sub">${escapeHtml(state.user.phone)}</div></div>
           <button class="logout-button" type="button" data-action="logout">Sign out</button>
         </div>
       </aside>
-      <section class="panel">
-        <div class="panel-top">
-          <h2>Messages <span class="unread-total" id="unread-message-count" hidden></span></h2>
-          <p>Your conversations with friends.</p>
-          <label class="search-box"><span aria-hidden="true">⌕</span><input id="conversation-search" type="search" placeholder="Search conversations" aria-label="Search conversations" /></label>
-        </div>
-        <div class="conversation-list" id="conversation-list"></div>
-      </section>
       <section class="chat-panel" id="chat-panel"></section>
     </div>`;
 
   renderSidebar();
-  renderConversationList();
   renderThread();
   syncUnreadIndicators();
 }
@@ -444,36 +464,34 @@ function renderSidebar() {
       </div>`).join('')
     : '<div class="empty-list">No new requests. Add a friend by phone number to get started.</div>';
 
-  friendList.innerHTML = state.friends.length
-    ? state.friends.map((friend) => `
-      <button class="friend-item ${String(selectedConversation()?.friend?.id) === String(friend.id) ? 'active' : ''}" type="button" data-action="open-friend" data-id="${escapeHtml(friend.id)}" aria-label="Chat with ${escapeHtml(friend.name)}">
-        ${friendAvatar(friend, 'sm', true)}
-        <span class="person-info"><span class="person-name">${escapeHtml(friend.name)}</span><span class="person-sub">${escapeHtml(friend.phone)}</span><span class="presence-label ${state.socketConnected && isOnline(friend.id) ? 'online' : ''}" data-presence-label="${escapeHtml(friend.id)}">${presenceText(friend.id)}</span></span>
-        <span class="friend-open">Chat</span>
-      </button>`).join('')
-    : '<div class="empty-list">Accepted friends will show up here. Add someone using their phone number above.</div>';
-}
-
-function renderConversationList() {
-  const list = document.querySelector('#conversation-list');
-  if (!list) return;
-  const filter = (document.querySelector('#conversation-search')?.value || '').trim().toLowerCase();
-  const conversations = state.conversations.filter((conversation) =>
-    !filter || `${conversation.friend?.name || ''} ${conversation.last_message?.body || conversation.last_message?.attachment?.name || ''}`.toLowerCase().includes(filter));
-
-  list.innerHTML = conversations.length
-    ? conversations.map((conversation) => `
-      <button class="conversation-item ${String(conversation.id) === String(state.selectedConversationId) ? 'active' : ''} ${Number(conversation.unread_count) > 0 ? 'has-unread' : ''}" type="button" data-action="select-conversation" data-id="${escapeHtml(conversation.id)}">
-        ${friendAvatar(conversation.friend, 'lg', true)}
-        <span class="person-info">
-          <span class="person-name">${escapeHtml(conversation.friend?.name)}</span>
-          <span class="conversation-preview">${escapeHtml(conversation.last_message?.body || conversation.last_message?.attachment?.name || 'Start a conversation')}</span>
-        </span>
-        <span class="conversation-meta">${formattedTime(conversation.last_message?.created_at || conversation.updated_at)}
-          ${conversation.unread_count ? `<span class="counter">${escapeHtml(conversation.unread_count)}</span>` : ''}
-        </span>
-      </button>`).join('')
-    : '<div class="empty-list">No conversations yet. Choose a friend to say hello.</div>';
+  const filter = (document.querySelector('#friend-search')?.value || '').trim().toLowerCase();
+  const friends = state.friends.filter((friend) => {
+    const conversation = conversationForFriend(friend.id);
+    const preview = conversation?.last_message?.body ||
+      conversation?.last_message?.attachment?.name || '';
+    return !filter || `${friend.name || ''} ${preview}`.toLowerCase().includes(filter);
+  });
+  friendList.innerHTML = friends.length
+    ? friends.map((friend) => {
+      const conversation = conversationForFriend(friend.id);
+      const unreadCount = Number(conversation?.unread_count) || 0;
+      const lastMessage = conversation?.last_message;
+      const preview = lastMessage?.body || lastMessage?.attachment?.name || 'Start a conversation';
+      const messagePreview = lastMessage && String(lastMessage.sender?.id) === String(state.user.id)
+        ? `You: ${preview}`
+        : preview;
+      return `
+        <button class="friend-item ${String(selectedConversation()?.friend?.id) === String(friend.id) ? 'active' : ''} ${unreadCount ? 'has-unread' : ''}" type="button" data-action="open-friend" data-id="${escapeHtml(friend.id)}" aria-label="Chat with ${escapeHtml(friend.name)}${unreadCount ? `, ${unreadCount} unread messages` : ''}">
+          ${friendAvatar(friend, 'sm', true)}
+          <span class="person-info"><span class="person-name">${escapeHtml(friend.name)}</span><span class="conversation-preview">${escapeHtml(messagePreview)}</span></span>
+          <span class="conversation-meta">${lastMessage ? formattedTime(lastMessage.created_at) : ''}
+            ${unreadCount ? `<span class="counter">${escapeHtml(unreadCount)}</span>` : ''}
+          </span>
+        </button>`;
+    }).join('')
+    : state.friends.length
+      ? '<div class="empty-list">No friends match your search.</div>'
+      : '<div class="empty-list">Accepted friends will show up here. Add someone using their phone number above.</div>';
 }
 
 function renderThread() {
@@ -492,6 +510,7 @@ function renderThread() {
 
   panel.innerHTML = `
     <header class="chat-header">
+      <button class="icon-button back-to-friends" type="button" data-action="show-friends" title="Back to friends" aria-label="Back to friends">‹</button>
       ${friendAvatar(conversation.friend, 'lg', true)}
       <div class="chat-heading"><h2>${escapeHtml(conversation.friend?.name)}</h2><p id="chat-status">${presenceText(conversation.friend?.id)}</p></div>
       <div class="chat-actions">
@@ -628,7 +647,7 @@ function syncUnreadIndicators() {
     unreadLabel.textContent = `${unreadCount} unread`;
     unreadLabel.hidden = unreadCount === 0;
   }
-  document.title = unreadCount ? `(${unreadCount}) Delickate — Messages` : 'Delickate — Messages';
+  document.title = unreadCount ? `(${unreadCount}) PITBConnect — Messages` : 'PITBConnect — Messages';
   window.desktopApp?.setUnreadCount(unreadCount, shouldNotify);
 }
 
@@ -653,7 +672,7 @@ async function loadMessages({ markRead = true } = {}) {
     state.messages = await api(`/conversations/${encodeURIComponent(conversation.id)}/messages`)
       .then((result) => Array.isArray(result.data) ? result.data : []);
     conversation.unread_count = 0;
-    renderConversationList();
+    renderSidebar();
     syncUnreadIndicators();
   }
   await cacheMessageImages(conversation.id, state.messages);
@@ -685,7 +704,6 @@ async function refreshData() {
       renderThread();
     }
     renderSidebar();
-    renderConversationList();
 
     if (state.selectedConversationId) {
       await loadMessages();
@@ -708,7 +726,6 @@ function presenceText(userId) {
 
 function updatePresenceViews() {
   renderSidebar();
-  renderConversationList();
   const conversation = selectedConversation();
   const status = document.querySelector('#chat-status');
   if (status && conversation) {
@@ -1132,13 +1149,12 @@ async function openFriend(friendId) {
   joinSelectedConversation();
   await loadMessages();
   renderMessages();
-  renderConversationList();
 }
 
 async function handleAuthSubmit(form) {
   const formData = new FormData(form);
   const body = Object.fromEntries(formData.entries());
-  body.device_name = 'daylight-desktop';
+  body.device_name = 'pitbconnect-desktop';
   const path = state.authMode === 'signup' ? '/auth/register' : '/auth/login';
   const submitButton = form.querySelector('button[type="submit"]');
   submitButton.disabled = true;
@@ -1345,6 +1361,41 @@ async function logout() {
   }
 }
 
+function renderUpdateStatus() {
+  const version = document.querySelector('#app-version');
+  if (version && state.appVersion) version.textContent = `PITBConnect v${state.appVersion}`;
+  const status = document.querySelector('#update-status');
+  if (status) status.textContent = state.updateStatus;
+  document.querySelectorAll('[data-action="check-updates"]').forEach((button) => {
+    button.disabled = state.updateStatus === 'Checking for updates…';
+  });
+  document.querySelectorAll('[data-action="download-update"]').forEach((button) => {
+    button.hidden = !state.updateAvailableVersion;
+    if (state.updateAvailableVersion) {
+      button.textContent = `Download v${state.updateAvailableVersion}`;
+    }
+  });
+}
+
+async function checkForUpdates(manual = true) {
+  state.updateStatus = 'Checking for updates…';
+  renderUpdateStatus();
+  try {
+    const result = await window.desktopApp.checkForUpdates();
+    state.appVersion = result.currentVersion;
+    state.updateAvailableVersion = result.updateAvailable ? result.latestVersion : null;
+    state.updateStatus = result.updateAvailable
+      ? `Version ${result.latestVersion} is available.`
+      : `You're up to date (v${result.currentVersion}).`;
+    renderUpdateStatus();
+    if (manual && !result.updateAvailable) showNotice(state.updateStatus, 'success');
+  } catch (error) {
+    state.updateStatus = `Could not check for updates: ${error.message}`;
+    renderUpdateStatus();
+    if (manual) throw error;
+  }
+}
+
 app.addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.target;
@@ -1389,6 +1440,10 @@ app.addEventListener('click', async (event) => {
     if (action === 'toggle-auth') {
       state.authMode = state.authMode === 'login' ? 'signup' : 'login';
       render();
+    } else if (action === 'check-updates') {
+      await checkForUpdates();
+    } else if (action === 'download-update') {
+      await window.desktopApp.downloadUpdate(state.updateAvailableVersion);
     } else if (action === 'logout') {
       await logout();
     } else if (action === 'refresh') {
@@ -1401,6 +1456,19 @@ app.addEventListener('click', async (event) => {
       await startCall(action === 'call-video' ? 'video' : 'audio');
     } else if (action === 'choose-attachment') {
       document.querySelector('#attachment-input')?.click();
+    } else if (action === 'show-friends') {
+      if (state.activeRoomId) window.chatSocket?.leaveConversation(state.activeRoomId);
+      state.activeRoomId = null;
+      state.joinedRoomId = null;
+      state.selectedConversationId = null;
+      state.messages = [];
+      state.selectedAttachment = null;
+      const attachmentInput = document.querySelector('#attachment-input');
+      if (attachmentInput) attachmentInput.value = '';
+      clearAttachmentPreview();
+      stopLocalTyping();
+      clearTypingIndicator();
+      render();
     } else if (action === 'remove-attachment') {
       state.selectedAttachment = null;
       const attachmentInput = document.querySelector('#attachment-input');
@@ -1418,26 +1486,6 @@ app.addEventListener('click', async (event) => {
       await handleRequestResponse(button);
     } else if (action === 'open-friend') {
       await openFriend(id);
-    } else if (action === 'select-conversation') {
-      if (state.activeRoomId && String(state.activeRoomId) !== String(id)) {
-        window.chatSocket?.leaveConversation(state.activeRoomId);
-        state.activeRoomId = null;
-        state.joinedRoomId = null;
-      }
-      stopLocalTyping();
-      clearTypingIndicator();
-      state.selectedConversationId = id;
-      state.messages = [];
-      state.selectedAttachment = null;
-      const attachmentInput = document.querySelector('#attachment-input');
-      if (attachmentInput) attachmentInput.value = '';
-      clearAttachmentPreview();
-      renderThread();
-      renderConversationList();
-      joinSelectedConversation();
-      await loadMessages();
-      renderMessages();
-      await refreshData();
     }
   } catch (error) {
     showNotice(error.message || 'Something went wrong. Please try again.');
@@ -1460,7 +1508,7 @@ document.querySelector('#call-overlay')?.addEventListener('click', async (event)
 });
 
 app.addEventListener('input', (event) => {
-  if (event.target.id === 'conversation-search') renderConversationList();
+  if (event.target.id === 'friend-search') renderSidebar();
   if (event.target.matches('#message-form textarea')) handleMessageTyping();
 });
 
@@ -1497,6 +1545,7 @@ app.addEventListener('keydown', (event) => {
 });
 
 window.chatSocket?.onEvent(handleSocketEvent);
+checkForUpdates(false);
 
 if (state.token && state.user) {
   render();
