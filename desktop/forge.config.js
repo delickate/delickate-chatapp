@@ -1,3 +1,4 @@
+const path = require('node:path');
 const { FusesPlugin } = require('@electron-forge/plugin-fuses');
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 
@@ -17,6 +18,7 @@ module.exports = {
   packagerConfig: {
     asar: true,
     executableName: 'PITBConnect',
+    tmpdir: path.join(__dirname, 'out', '.packager-tmp'),
   },
   rebuildConfig: {},
   makers: [

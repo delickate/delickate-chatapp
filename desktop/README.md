@@ -25,6 +25,8 @@ are saved locally for this desktop user. The default socket URL is
 - Bearer-token session and sign-out.
 - Friend requests by phone, incoming request accept/reject, and accepted
   friends list.
+- A friends-first sidebar with expandable search, add-friend, request, refresh,
+  and update actions.
 - One-to-one chat with paginated message history, send, unread counts, and
   seen/delivered receipt display.
 - Attach and download JPEG, PNG, GIF, WebP, PDF, and plain-text files (5 MiB
@@ -73,3 +75,11 @@ The Windows installer is downloaded directly and run by the user; updates are
 not installed silently. Existing installations must first install a build
 containing the update checker; subsequent releases can be discovered in-app.
 For a local Windows build, use `npm run make`.
+
+If Windows reports `EPERM` while Electron Packager renames a directory in
+`%TEMP%\electron-packager`, close other packaging runs and retry. Builds use a
+dedicated temporary directory under `desktop/out/.packager-tmp` to avoid locks
+in the shared Windows temp folder. If the error persists, Windows Security or
+another antivirus may be holding files briefly; allow the build to finish or
+add the project build directory to its exclusions according to your
+organization's policy.

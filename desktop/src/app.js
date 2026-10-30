@@ -37,6 +37,8 @@ const state = {
   authMode: 'login',
   friends: [],
   requests: [],
+  sidebarTool: null,
+  friendSearchQuery: '',
   conversations: [],
   unreadCount: null,
   selectedConversationId: null,
@@ -419,18 +421,17 @@ function showChatShell() {
       <aside class="rail">
         <header class="rail-brand">
           <div class="brand-lockup"><span class="brand-mark">P</span><span>PITBConnect</span></div>
-          <button class="icon-button" type="button" data-action="refresh" title="Refresh" aria-label="Refresh">↻</button>
         </header>
-        <div class="section-head"><h2>Friend requests</h2><span class="counter" id="request-count">0</span></div>
-        <div class="request-list" id="request-list"></div>
-        <div class="section-head chats-head"><h2>Chats</h2><span class="unread-total" id="unread-message-count" hidden></span></div>
-        <label class="search-box friend-search"><span aria-hidden="true">⌕</span><input id="friend-search" type="search" placeholder="Search friends" aria-label="Search friends" /></label>
-        <form class="add-friend" id="add-friend-form">
-          <input name="phone" type="tel" inputmode="tel" pattern="\\+[1-9][0-9]{7,14}" placeholder="+1 555 123 4567" aria-label="Friend's phone number" required />
-          <button type="submit" title="Send friend request" aria-label="Send friend request">+</button>
-        </form>
+        <nav class="rail-tools" aria-label="Friend list actions">
+          <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="search" aria-label="Search friends" aria-expanded="false" title="Search friends"><span aria-hidden="true">⌕</span><span>Search</span></button>
+          <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="add" aria-label="Add a friend" aria-expanded="false" title="Add a friend"><span aria-hidden="true">＋</span><span>Add</span></button>
+          <button class="rail-tool request-tool" type="button" data-action="toggle-sidebar-tool" data-tool="requests" aria-label="Friend requests" aria-expanded="false" title="Friend requests"><span aria-hidden="true">✉</span><span>Requests</span><span class="tool-badge" id="request-count" hidden></span></button>
+          <button class="rail-tool" type="button" data-action="refresh" aria-label="Refresh friends and messages" title="Refresh"><span aria-hidden="true">↻</span><span>Sync</span></button>
+          <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="updates" aria-label="Check app updates" aria-expanded="false" title="App updates"><span aria-hidden="true">⋯</span><span>Updates</span></button>
+        </nav>
+        <div class="sidebar-tools" id="sidebar-tools" hidden></div>
+        <div class="friend-list-heading"><h2>Friends</h2><span class="unread-total" id="unread-message-count" hidden></span></div>
         <div class="friend-list" id="friend-list"></div>
-        ${updateControls()}
         <div class="profile">
           ${friendAvatar(state.user, 'sm')}
           <div class="person-info"><div class="person-name">${escapeHtml(state.user.name)}</div><div class="person-sub">${escapeHtml(state.user.phone)}</div></div>
@@ -446,25 +447,64 @@ function showChatShell() {
 }
 
 function renderSidebar() {
-  const requestList = document.querySelector('#request-list');
+  const toolsPanel = document.querySelector('#sidebar-tools');
   const requestCount = document.querySelector('#request-count');
   const friendList = document.querySelector('#friend-list');
-  if (!requestList || !friendList || !requestCount) return;
+  if (!toolsPanel || !friendList || !requestCount) return;
 
-  requestCount.textContent = String(state.requests.length);
-  requestList.innerHTML = state.requests.length
-    ? state.requests.map((request) => `
-      <div class="request-row">
-        ${friendAvatar(request.user)}
-        <div class="request-info"><div class="person-name">${escapeHtml(request.user?.name)}</div><div class="person-sub">${escapeHtml(request.user?.phone)}</div></div>
-        <div class="request-actions">
-          <button type="button" data-action="respond-request" data-id="${escapeHtml(request.id)}" data-response="accept" title="Accept request" aria-label="Accept ${escapeHtml(request.user?.name)}">✓</button>
-          <button type="button" class="reject" data-action="respond-request" data-id="${escapeHtml(request.id)}" data-response="reject" title="Reject request" aria-label="Reject ${escapeHtml(request.user?.name)}">×</button>
+  requestCount.textContent = state.requests.length ? String(state.requests.length) : '';
+  requestCount.hidden = state.requests.length === 0;
+  document.querySelectorAll('[data-action="toggle-sidebar-tool"]').forEach((button) => {
+    const active = button.dataset.tool === state.sidebarTool;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-expanded', String(active));
+  });
+  toolsPanel.hidden = !state.sidebarTool;
+  toolsPanel.innerHTML = renderSidebarTool();
+  renderFriendList();
+}
+
+function renderSidebarTool() {
+  if (state.sidebarTool === 'search') {
+    return `
+      <label class="search-box friend-search"><span aria-hidden="true">⌕</span><input id="friend-search" type="search" value="${escapeHtml(state.friendSearchQuery)}" placeholder="Search friends or messages" aria-label="Search friends or messages" /></label>`;
+  }
+  if (state.sidebarTool === 'add') {
+    return `
+      <form class="add-friend" id="add-friend-form">
+        <label class="tool-field-label" for="friend-phone">Add a friend by phone</label>
+        <div class="add-friend-entry">
+          <input id="friend-phone" name="phone" type="tel" inputmode="tel" pattern="\\+[1-9][0-9]{7,14}" placeholder="+1 555 123 4567" aria-label="Friend's phone number" required />
+          <button type="submit" title="Send friend request" aria-label="Send friend request">Send</button>
         </div>
-      </div>`).join('')
-    : '<div class="empty-list">No new requests. Add a friend by phone number to get started.</div>';
+      </form>`;
+  }
+  if (state.sidebarTool === 'requests') {
+    return `
+      <section class="tool-section" aria-label="Friend requests">
+        <h2>Friend requests${state.requests.length ? ` (${state.requests.length})` : ''}</h2>
+        <div class="request-list">${state.requests.length
+          ? state.requests.map((request) => `
+            <div class="request-row">
+              ${friendAvatar(request.user)}
+              <div class="request-info"><div class="person-name">${escapeHtml(request.user?.name)}</div><div class="person-sub">${escapeHtml(request.user?.phone)}</div></div>
+              <div class="request-actions">
+                <button type="button" data-action="respond-request" data-id="${escapeHtml(request.id)}" data-response="accept" title="Accept request" aria-label="Accept ${escapeHtml(request.user?.name)}">✓</button>
+                <button type="button" class="reject" data-action="respond-request" data-id="${escapeHtml(request.id)}" data-response="reject" title="Reject request" aria-label="Reject ${escapeHtml(request.user?.name)}">×</button>
+              </div>
+            </div>`).join('')
+          : '<div class="empty-list">No pending friend requests.</div>'}
+        </div>
+      </section>`;
+  }
+  if (state.sidebarTool === 'updates') return updateControls();
+  return '';
+}
 
-  const filter = (document.querySelector('#friend-search')?.value || '').trim().toLowerCase();
+function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.friendSearchQuery : '') {
+  const friendList = document.querySelector('#friend-list');
+  if (!friendList) return;
+  const filter = filterValue.trim().toLowerCase();
   const friends = state.friends.filter((friend) => {
     const conversation = conversationForFriend(friend.id);
     const preview = conversation?.last_message?.body ||
@@ -491,7 +531,7 @@ function renderSidebar() {
     }).join('')
     : state.friends.length
       ? '<div class="empty-list">No friends match your search.</div>'
-      : '<div class="empty-list">Accepted friends will show up here. Add someone using their phone number above.</div>';
+      : '<div class="empty-list">Your accepted friends will appear here. Select Add to invite someone.</div>';
 }
 
 function renderThread() {
@@ -1141,6 +1181,7 @@ async function openFriend(friendId) {
   }
   stopLocalTyping();
   clearTypingIndicator();
+  state.sidebarTool = null;
   state.selectedConversationId = conversation.id;
   state.messages = [];
   state.selectedAttachment = null;
@@ -1440,6 +1481,12 @@ app.addEventListener('click', async (event) => {
     if (action === 'toggle-auth') {
       state.authMode = state.authMode === 'login' ? 'signup' : 'login';
       render();
+    } else if (action === 'toggle-sidebar-tool') {
+      state.sidebarTool = state.sidebarTool === button.dataset.tool ? null : button.dataset.tool;
+      renderSidebar();
+      if (state.sidebarTool === 'search') {
+        document.querySelector('#friend-search')?.focus();
+      }
     } else if (action === 'check-updates') {
       await checkForUpdates();
     } else if (action === 'download-update') {
@@ -1508,7 +1555,10 @@ document.querySelector('#call-overlay')?.addEventListener('click', async (event)
 });
 
 app.addEventListener('input', (event) => {
-  if (event.target.id === 'friend-search') renderSidebar();
+  if (event.target.id === 'friend-search') {
+    state.friendSearchQuery = event.target.value;
+    renderFriendList();
+  }
   if (event.target.matches('#message-form textarea')) handleMessageTyping();
 });
 
