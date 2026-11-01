@@ -75,7 +75,22 @@ const state = {
 };
 
 function normalizeApiUrl(value) {
-  return value.trim().replace(/\/+$/, '');
+  const raw = String(value ?? '').trim();
+  if (!raw) return DEFAULT_API_URL;
+
+  try {
+    const parsed = new URL(raw);
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    if (!pathname || pathname === '/') {
+      parsed.pathname = '/api';
+    } else if (!pathname.toLowerCase().endsWith('/api')) {
+      parsed.pathname = `${pathname}/api`;
+    }
+    return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    const normalized = raw.replace(/\/+$/, '');
+    return normalized.toLowerCase().endsWith('/api') ? normalized : `${normalized}/api`;
+  }
 }
 
 function readStoredValue(key, legacyKey) {
@@ -470,6 +485,8 @@ function showChatShell() {
 }
 
 function renderSidebar() {
+  state.conversations = sortConversationsByLatest(state.conversations);
+
   const toolsPanel = document.querySelector('#sidebar-tools');
   const requestCount = document.querySelector('#request-count');
   const friendList = document.querySelector('#friend-list');
@@ -528,7 +545,17 @@ function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.f
   const friendList = document.querySelector('#friend-list');
   if (!friendList) return;
   const filter = filterValue.trim().toLowerCase();
-  const friends = state.friends.filter((friend) => {
+  const sortedFriends = [...state.friends].sort((left, right) => {
+    const leftConversation = conversationForFriend(left.id);
+    const rightConversation = conversationForFriend(right.id);
+    const leftTime = Date.parse(conversationTimestamp(leftConversation) || 0);
+    const rightTime = Date.parse(conversationTimestamp(rightConversation) || 0);
+    if (Number.isNaN(leftTime) && Number.isNaN(rightTime)) return 0;
+    if (Number.isNaN(leftTime)) return 1;
+    if (Number.isNaN(rightTime)) return -1;
+    return rightTime - leftTime;
+  });
+  const friends = sortedFriends.filter((friend) => {
     const conversation = conversationForFriend(friend.id);
     const preview = conversation?.last_message?.body ||
       conversation?.last_message?.attachment?.name || '';

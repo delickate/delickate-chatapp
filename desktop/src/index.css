@@ -212,8 +212,8 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .request-actions { display: flex; gap: 5px; }
 .request-actions button { display: grid; place-items: center; width: 25px; height: 25px; padding: 0; border: 0; border-radius: 8px; color: var(--green); background: var(--green-soft); font-size: 13px; }
 .request-actions button.reject { color: #a36c67; background: #fbefed; }
-.friend-list { flex: 1 1 0; min-height: 0; padding-bottom: 14px; background: rgba(255,255,255,.18); }
-.friend-item { display: flex; align-items: center; gap: 11px; width: 100%; min-height: 67px; padding: 10px; border: 0; border-radius: 14px; background: rgba(255,255,255,.12); text-align: left; }
+.friend-list { flex: 1 1 0; min-height: 0; align-content: start; padding-bottom: 14px; background: rgba(255,255,255,.18); }
+.friend-item { display: flex; align-items: center; gap: 11px; width: 100%; min-height: 67px; padding: 10px; border: 0; border-radius: 14px; background: rgba(255,255,255,.12); text-align: left; align-self: start; }
 .friend-item:hover { background: rgba(143, 136, 217, .06); }
 .friend-item.active { background: linear-gradient(90deg, rgba(77,159,154,.10), rgba(141,134,217,.06)); box-shadow: inset 0 0 0 1px rgba(77,159,154,.08); }
 .friend-item.has-unread:not(.active) { background: rgba(234,249,245,.8); }
