@@ -62,6 +62,7 @@ const SOCKET_EVENTS = [
   'call:busy',
   'call:error',
 ];
+const MEDIA_PERMISSIONS = new Set(['media', 'camera', 'microphone']);
 const CALL_CLIENT_EVENTS = new Set([
   'call:ready',
   'call:invite',
@@ -348,15 +349,12 @@ const createWindow = () => {
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
   let mediaPermissionGranted = false;
-  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-    if (permission !== 'media') {
-      callback(false);
+  const requestMediaPermission = () => new Promise((resolve) => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      resolve(false);
       return;
     }
-    if (mediaPermissionGranted) {
-      callback(true);
-      return;
-    }
+
     dialog.showMessageBox(mainWindow, {
       type: 'question',
       title: 'Allow microphone and camera',
@@ -366,11 +364,23 @@ app.whenReady().then(() => {
       cancelId: 1,
     }).then(({ response }) => {
       mediaPermissionGranted = response === 0;
-      callback(mediaPermissionGranted);
+      resolve(mediaPermissionGranted);
     }).catch((error) => {
       console.error('Media permission prompt failed:', error);
-      callback(false);
+      resolve(false);
     });
+  });
+
+  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+    if (!MEDIA_PERMISSIONS.has(permission)) {
+      callback(false);
+      return;
+    }
+    if (mediaPermissionGranted) {
+      callback(true);
+      return;
+    }
+    requestMediaPermission().then((granted) => callback(granted)).catch(() => callback(false));
   });
   createWindow();
 

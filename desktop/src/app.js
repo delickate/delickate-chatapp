@@ -1102,6 +1102,13 @@ function handleSocketEvent(event, payload) {
     showNotice(payload.message);
   } else if (event === 'call:config' && Array.isArray(payload?.ice_servers) && payload.ice_servers.length) {
     state.iceServers = payload.ice_servers;
+    const hasTurnRelay = state.iceServers.some((server) => {
+      const urls = Array.isArray(server?.urls) ? server.urls : [server?.urls];
+      return urls.some((url) => /^turns?:/i.test(String(url || '')));
+    });
+    if (!hasTurnRelay) {
+      showNotice('No TURN relay is configured on the socket server. Calls may fail behind NAT or a firewall.');
+    }
   } else if (event.startsWith('call:')) {
     void handleCallSocketEvent(event, payload);
   }
