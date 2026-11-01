@@ -76,11 +76,37 @@ let mainWindow;
 let socketClient;
 
 function parseVersion(value) {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(value);
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(value ?? '').trim());
   if (!match) {
     throw new Error(`Invalid application version: ${value}`);
   }
   return match.slice(1).map(Number);
+}
+
+function normalizeReleaseVersion(value) {
+  if (typeof value !== 'string') return null;
+  const match = /v?(\d+)\.(\d+)\.(\d+)/.exec(value.trim());
+  return match ? match[0].replace(/^v/i, '') : null;
+}
+
+function getReleaseDownloadUrl(release, version) {
+  const exactVersion = version ? String(version).trim() : '';
+  const assets = Array.isArray(release?.assets) ? release.assets : [];
+  const installerAsset = assets.find((asset) => {
+    const assetName = String(asset?.name || '').toLowerCase();
+    return assetName.includes('pitbconnect') && (assetName.endsWith('.exe') || assetName.includes('setup'));
+  });
+
+  if (installerAsset?.browser_download_url) {
+    return installerAsset.browser_download_url;
+  }
+
+  if (exactVersion) {
+    const [major, minor, patch] = parseVersion(exactVersion);
+    return `${RELEASES_DOWNLOAD_URL}/v${major}.${minor}.${patch}/PITBConnectSetup.exe`;
+  }
+
+  return release?.html_url || 'https://github.com/delickate/delickate-chatapp/releases';
 }
 
 function isNewerVersion(candidate, current) {
@@ -119,11 +145,11 @@ ipcMain.handle('desktop:check-updates', async (event) => {
   }
 
   const release = await response.json();
-  if (typeof release.tag_name !== 'string') {
-    throw new Error('The latest GitHub release does not have a valid version tag.');
+  const latestVersion = normalizeReleaseVersion(release?.tag_name);
+  if (!latestVersion) {
+    throw new Error('The latest GitHub release does not have a valid semantic version tag.');
   }
 
-  const latestVersion = release.tag_name.replace(/^v/, '');
   parseVersion(latestVersion);
   return {
     currentVersion: APP_VERSION,
@@ -132,14 +158,27 @@ ipcMain.handle('desktop:check-updates', async (event) => {
   };
 });
 
-ipcMain.handle('desktop:download-update', (event, version) => {
+ipcMain.handle('desktop:download-update', async (event, version) => {
   if (!isMainWindowEvent(event)) {
     throw new Error('Updates can only be downloaded by the app window.');
   }
-  const [major, minor, patch] = parseVersion(version);
-  return shell.openExternal(
-    `${RELEASES_DOWNLOAD_URL}/v${major}.${minor}.${patch}/PITBConnectSetup.exe`,
-  );
+
+  const response = await fetch(RELEASES_API_URL, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'PITBConnect-Desktop',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`GitHub release lookup failed (${response.status}).`);
+  }
+
+  const release = await response.json();
+  const candidateUrl = getReleaseDownloadUrl(release, version);
+  return shell.openExternal(candidateUrl);
 });
 
 function sendSocketEvent(event, payload) {

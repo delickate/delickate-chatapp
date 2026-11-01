@@ -39,6 +39,7 @@ const state = {
   requests: [],
   sidebarTool: null,
   friendSearchQuery: '',
+  addFriendPhone: '',
   conversations: [],
   unreadCount: null,
   selectedConversationId: null,
@@ -145,6 +146,21 @@ function formattedDay(value) {
   if (date.toDateString() === today.toDateString()) return 'Today';
   if (date.toDateString() === yesterday.toDateString()) return 'Yesterday';
   return new Intl.DateTimeFormat(undefined, { month: 'long', day: 'numeric', year: 'numeric' }).format(date);
+}
+
+function conversationTimestamp(conversation) {
+  return conversation?.last_message?.created_at || conversation?.updated_at || conversation?.created_at || '';
+}
+
+function sortConversationsByLatest(conversations) {
+  return [...conversations].sort((left, right) => {
+    const leftTime = Date.parse(conversationTimestamp(left) || 0);
+    const rightTime = Date.parse(conversationTimestamp(right) || 0);
+    if (Number.isNaN(leftTime) && Number.isNaN(rightTime)) return 0;
+    if (Number.isNaN(leftTime)) return 1;
+    if (Number.isNaN(rightTime)) return -1;
+    return rightTime - leftTime;
+  });
 }
 
 function showNotice(message, type = 'error') {
@@ -400,8 +416,15 @@ function isOnline(userId) {
   return state.onlineFriendIds.has(String(userId));
 }
 
+function avatarMarkup(user, size = 'sm') {
+  if (user?.avatar_url) {
+    return `<img class="avatar ${size} avatar-image" src="${escapeHtml(user.avatar_url)}" alt="${escapeHtml(user.name || 'User avatar')}" loading="lazy" decoding="async">`;
+  }
+  return `<span class="avatar ${size} ${colorClass(user?.id)}" aria-hidden="true">${escapeHtml(initials(user?.name))}</span>`;
+}
+
 function friendAvatar(user, size = 'sm', withPresence = false) {
-  const avatar = `<span class="avatar ${size} ${colorClass(user?.id)}" aria-hidden="true">${escapeHtml(initials(user?.name))}</span>`;
+  const avatar = avatarMarkup(user, size);
   if (!withPresence) return avatar;
   const status = state.socketConnected && isOnline(user?.id) ? 'online' : 'offline';
   return `<span class="avatar-wrap">${avatar}<span class="presence-dot ${status}" aria-label="${status}"></span></span>`;
@@ -419,24 +442,24 @@ function showChatShell() {
   app.innerHTML = `
     <div class="app-shell ${state.selectedConversationId ? 'chat-open' : ''}">
       <aside class="rail">
-        <header class="rail-brand">
-          <div class="brand-lockup"><span class="brand-mark">P</span><span>PITBConnect</span></div>
-        </header>
-        <nav class="rail-tools" aria-label="Friend list actions">
+        <div class="friend-toolbar" aria-label="Friend list actions">
           <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="search" aria-label="Search friends" aria-expanded="false" title="Search friends"><span aria-hidden="true">⌕</span><span>Search</span></button>
           <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="add" aria-label="Add a friend" aria-expanded="false" title="Add a friend"><span aria-hidden="true">＋</span><span>Add</span></button>
           <button class="rail-tool request-tool" type="button" data-action="toggle-sidebar-tool" data-tool="requests" aria-label="Friend requests" aria-expanded="false" title="Friend requests"><span aria-hidden="true">✉</span><span>Requests</span><span class="tool-badge" id="request-count" hidden></span></button>
           <button class="rail-tool" type="button" data-action="refresh" aria-label="Refresh friends and messages" title="Refresh"><span aria-hidden="true">↻</span><span>Sync</span></button>
           <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="updates" aria-label="Check app updates" aria-expanded="false" title="App updates"><span aria-hidden="true">⋯</span><span>Updates</span></button>
-        </nav>
+        </div>
         <div class="sidebar-tools" id="sidebar-tools" hidden></div>
         <div class="friend-list-heading"><h2>Friends</h2><span class="unread-total" id="unread-message-count" hidden></span></div>
         <div class="friend-list" id="friend-list"></div>
         <div class="profile">
-          ${friendAvatar(state.user, 'sm')}
+          <button class="profile-avatar-button" type="button" data-action="choose-profile-picture" aria-label="Update profile picture" title="Update profile picture">
+            ${friendAvatar(state.user, 'sm')}
+          </button>
           <div class="person-info"><div class="person-name">${escapeHtml(state.user.name)}</div><div class="person-sub">${escapeHtml(state.user.phone)}</div></div>
           <button class="logout-button" type="button" data-action="logout">Sign out</button>
         </div>
+        <input id="profile-picture-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
       </aside>
       <section class="chat-panel" id="chat-panel"></section>
     </div>`;
@@ -474,7 +497,7 @@ function renderSidebarTool() {
       <form class="add-friend" id="add-friend-form">
         <label class="tool-field-label" for="friend-phone">Add a friend by phone</label>
         <div class="add-friend-entry">
-          <input id="friend-phone" name="phone" type="tel" inputmode="tel" pattern="\\+[1-9][0-9]{7,14}" placeholder="+1 555 123 4567" aria-label="Friend's phone number" required />
+          <input id="friend-phone" name="phone" type="tel" inputmode="tel" pattern="\\+[1-9][0-9]{7,14}" placeholder="+1 555 123 4567" value="${escapeHtml(state.addFriendPhone)}" aria-label="Friend's phone number" required />
           <button type="submit" title="Send friend request" aria-label="Send friend request">Send</button>
         </div>
       </form>`;
@@ -729,7 +752,9 @@ async function refreshData() {
     ]);
     state.friends = Array.isArray(friends.data) ? friends.data : [];
     state.requests = Array.isArray(requests.data) ? requests.data : [];
-    state.conversations = Array.isArray(conversations.data) ? conversations.data : [];
+    state.conversations = sortConversationsByLatest(
+      Array.isArray(conversations.data) ? conversations.data : [],
+    );
     syncUnreadIndicators();
     const friendSignature = state.friends.map((friend) => friend.id).sort().join(',');
     if (state.socketFriendSignature !== null && state.socketFriendSignature !== friendSignature) {
@@ -1179,7 +1204,7 @@ async function openFriend(friendId) {
       method: 'POST',
       body: { friend_id: Number(friendId) },
     });
-    state.conversations.unshift(conversation);
+    state.conversations = sortConversationsByLatest([...state.conversations, conversation]);
   }
   if (state.activeRoomId && String(state.activeRoomId) !== String(conversation.id)) {
     window.chatSocket?.leaveConversation(state.activeRoomId);
@@ -1224,6 +1249,7 @@ async function handleAddFriend(form) {
   const phone = new FormData(form).get('phone')?.toString().trim();
   if (!phone) return;
   await api('/friends/requests', { method: 'POST', body: { phone } });
+  state.addFriendPhone = '';
   form.reset();
   await refreshData();
   showNotice('Friend request sent.', 'success');
@@ -1365,6 +1391,30 @@ function isAllowedAttachment(file) {
   return Boolean(extension && ALLOWED_ATTACHMENT_EXTENSIONS.has(extension));
 }
 
+async function updateProfilePicture(file) {
+  if (!file) return;
+  const allowedTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+  if (!allowedTypes.has(file.type) || file.size > 5 * 1024 * 1024) {
+    throw new Error('Choose a JPEG, PNG, GIF, or WEBP image under 5 MB.');
+  }
+
+  const formData = new FormData();
+  formData.append('profile_picture', file);
+  const payload = await api('/user/profile-picture', {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!payload?.user) {
+    throw new Error('The avatar upload was accepted but the server did not return the updated profile.');
+  }
+
+  state.user = payload.user;
+  localStorage.setItem(USER_KEY, JSON.stringify(payload.user));
+  render();
+  showNotice('Profile picture updated.', 'success');
+}
+
 function toggleEmojiPicker() {
   const picker = document.querySelector('#emoji-picker');
   const button = document.querySelector('[data-action="toggle-emoji-picker"]');
@@ -1494,6 +1544,8 @@ app.addEventListener('click', async (event) => {
       if (state.sidebarTool === 'search') {
         document.querySelector('#friend-search')?.focus();
       }
+    } else if (action === 'choose-profile-picture') {
+      document.querySelector('#profile-picture-input')?.click();
     } else if (action === 'check-updates') {
       await checkForUpdates();
     } else if (action === 'download-update') {
@@ -1566,10 +1618,23 @@ app.addEventListener('input', (event) => {
     state.friendSearchQuery = event.target.value;
     renderFriendList();
   }
+  if (event.target.id === 'friend-phone') {
+    state.addFriendPhone = event.target.value;
+  }
   if (event.target.matches('#message-form textarea')) handleMessageTyping();
 });
 
 app.addEventListener('change', (event) => {
+  if (event.target.id === 'profile-picture-input') {
+    const file = event.target.files?.[0] || null;
+    event.target.value = '';
+    if (!file) return;
+    void updateProfilePicture(file).catch((error) => {
+      showNotice(error.message || 'The profile picture could not be updated.');
+    });
+    return;
+  }
+
   if (event.target.id !== 'attachment-input') return;
   const file = event.target.files?.[0] || null;
   if (file && !isAllowedAttachment(file)) {
