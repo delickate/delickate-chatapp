@@ -27,16 +27,21 @@ are saved locally for this desktop user. The default socket URL is
   friends list.
 - A friends-first sidebar with expandable search, add-friend, request, refresh,
   and update actions.
-- One-to-one chat with paginated message history, send, unread counts, and
-  seen/delivered receipt display.
+- One-to-one and group chats with paginated message history, send, unread
+  counts, and seen/delivered receipt display.
+- Create titled groups with accepted friends. Group membership is enforced by
+  the API and unread counts are tracked separately for each member.
 - Attach and download JPEG, PNG, GIF, WebP, PDF, and plain-text files (5 MiB
   maximum). The desktop checks the size before sending; Laravel performs the
   authoritative size, type, and content validation.
 - Image attachments are cached per signed-in user in Electron's local
   application data folder on both sender and recipient devices. Cached images
   appear inline in chat and remain available after restarting the desktop app.
+- Paste a copied screenshot or image into the chat message box to attach it;
+  it appears in the attachment preview and sends with the message.
 - One-to-one voice and video calls with incoming-call, mute, camera, and
-  hang-up controls. Electron asks permission for microphone and camera access;
+  hang-up controls. Call audio uses a separate playback control for both voice
+  and video calls. Electron asks permission for microphone and camera access;
   configure OS-level device permissions as well.
 
 The desktop client connects to the authenticated Socket.IO service for online
@@ -76,10 +81,11 @@ not installed silently. Existing installations must first install a build
 containing the update checker; subsequent releases can be discovered in-app.
 For a local Windows build, use `npm run make`.
 
-If Windows reports `EPERM` while Electron Packager renames a directory in
-`%TEMP%\electron-packager`, close other packaging runs and retry. Builds use a
-dedicated temporary directory under `desktop/out/.packager-tmp` to avoid locks
-in the shared Windows temp folder. If the error persists, Windows Security or
-another antivirus may be holding files briefly; allow the build to finish or
-add the project build directory to its exclusions according to your
-organization's policy.
+Builds use a process-specific temporary directory under
+`desktop/out/.packager-tmp` so overlapping packaging runs cannot clear or reuse
+each other's working files. A small compatibility patch copies the extracted
+Electron files when Windows temporarily blocks Packager's directory rename.
+The patch is reapplied after dependency installation and before desktop build
+commands. If the copy is also blocked, Windows Security or another antivirus
+may be holding files; allow the build to finish or add the project build
+directory to its exclusions according to your organization's policy.

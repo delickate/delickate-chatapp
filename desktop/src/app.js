@@ -40,6 +40,8 @@ const state = {
   sidebarTool: null,
   friendSearchQuery: '',
   addFriendPhone: '',
+  groupName: '',
+  selectedGroupFriendIds: new Set(),
   conversations: [],
   unreadCount: null,
   selectedConversationId: null,
@@ -114,9 +116,13 @@ function readStoredUser() {
 
 function updateCallButtons() {
   const available = Boolean(state.joinedRoomId &&
-    String(state.joinedRoomId) === String(state.selectedConversationId));
+    String(state.joinedRoomId) === String(state.selectedConversationId) &&
+    selectedConversation()?.type !== 'group');
   document.querySelectorAll('[data-action="call-audio"], [data-action="call-video"]')
-    .forEach((button) => { button.disabled = !available; });
+    .forEach((button) => {
+      button.disabled = !available;
+      button.hidden = selectedConversation()?.type === 'group';
+    });
 }
 
 function escapeHtml(value) {
@@ -453,6 +459,29 @@ function conversationForFriend(friendId) {
   return state.conversations.find((item) => String(item.friend?.id) === String(friendId)) || null;
 }
 
+function conversationTitle(conversation) {
+  return conversation?.type === 'group'
+    ? conversation.name
+    : conversation?.friend?.name || 'Conversation';
+}
+
+function conversationAvatar(conversation, size = 'sm', withPresence = false) {
+  if (conversation?.type !== 'group') {
+    return friendAvatar(conversation?.friend, size, withPresence);
+  }
+  return `<span class="avatar ${size} group-avatar" aria-label="Group">${escapeHtml(initials(conversation.name))}</span>`;
+}
+
+function messageAvatar(message) {
+  const conversation = selectedConversation();
+  if (conversation?.type !== 'group') {
+    return friendAvatar(conversation?.friend, 'message-avatar');
+  }
+  const sender = conversation.participants?.find((participant) =>
+    String(participant.id) === String(message.sender?.id));
+  return friendAvatar(sender || message.sender, 'message-avatar');
+}
+
 function showChatShell() {
   app.innerHTML = `
     <div class="app-shell ${state.selectedConversationId ? 'chat-open' : ''}">
@@ -460,6 +489,7 @@ function showChatShell() {
         <div class="friend-toolbar" aria-label="Friend list actions">
           <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="search" aria-label="Search friends" aria-expanded="false" title="Search friends"><span aria-hidden="true">⌕</span><span>Search</span></button>
           <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="add" aria-label="Add a friend" aria-expanded="false" title="Add a friend"><span aria-hidden="true">＋</span><span>Add</span></button>
+          <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="group" aria-label="Create a group" aria-expanded="false" title="Create a group"><span aria-hidden="true">◎</span><span>Group</span></button>
           <button class="rail-tool request-tool" type="button" data-action="toggle-sidebar-tool" data-tool="requests" aria-label="Friend requests" aria-expanded="false" title="Friend requests"><span aria-hidden="true">✉</span><span>Requests</span><span class="tool-badge" id="request-count" hidden></span></button>
           <button class="rail-tool" type="button" data-action="refresh" aria-label="Refresh friends and messages" title="Refresh"><span aria-hidden="true">↻</span><span>Sync</span></button>
           <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="updates" aria-label="Check app updates" aria-expanded="false" title="App updates"><span aria-hidden="true">⋯</span><span>Updates</span></button>
@@ -519,6 +549,23 @@ function renderSidebarTool() {
         </div>
       </form>`;
   }
+  if (state.sidebarTool === 'group') {
+    return `
+      <form class="create-group" id="create-group-form">
+        <label class="tool-field-label" for="group-name">New group</label>
+        <input id="group-name" name="name" type="text" maxlength="100" value="${escapeHtml(state.groupName)}" placeholder="Group title" required />
+        <div class="group-friend-options" role="group" aria-label="Choose friends">
+          ${state.friends.length
+            ? state.friends.map((friend) => `
+              <label class="group-friend-option">
+                <input type="checkbox" name="friend_ids" value="${escapeHtml(friend.id)}" ${state.selectedGroupFriendIds.has(String(friend.id)) ? 'checked' : ''} />
+                <span>${escapeHtml(friend.name)}</span>
+              </label>`).join('')
+            : '<span class="empty-list">Add friends before creating a group.</span>'}
+        </div>
+        <button class="small-button create-group-submit" type="submit" ${state.friends.length ? '' : 'disabled'}>Create group</button>
+      </form>`;
+  }
   if (state.sidebarTool === 'requests') {
     return `
       <section class="tool-section" aria-label="Friend requests">
@@ -545,25 +592,27 @@ function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.f
   const friendList = document.querySelector('#friend-list');
   if (!friendList) return;
   const filter = filterValue.trim().toLowerCase();
-  const sortedFriends = [...state.friends].sort((left, right) => {
-    const leftConversation = conversationForFriend(left.id);
-    const rightConversation = conversationForFriend(right.id);
-    const leftTime = Date.parse(conversationTimestamp(leftConversation) || 0);
-    const rightTime = Date.parse(conversationTimestamp(rightConversation) || 0);
+  const entries = [
+    ...state.friends.map((friend) => ({ kind: 'friend', friend, conversation: conversationForFriend(friend.id) })),
+    ...state.conversations
+      .filter((conversation) => conversation.type === 'group')
+      .map((conversation) => ({ kind: 'group', conversation })),
+  ].filter(({ friend, conversation }) => {
+    const preview = conversation?.last_message?.body ||
+      conversation?.last_message?.attachment?.name || '';
+    return !filter || `${friend?.name || conversationTitle(conversation)} ${preview}`
+      .toLowerCase().includes(filter);
+  }).sort((left, right) => {
+    const leftTime = Date.parse(conversationTimestamp(left.conversation) || 0);
+    const rightTime = Date.parse(conversationTimestamp(right.conversation) || 0);
     if (Number.isNaN(leftTime) && Number.isNaN(rightTime)) return 0;
     if (Number.isNaN(leftTime)) return 1;
     if (Number.isNaN(rightTime)) return -1;
     return rightTime - leftTime;
   });
-  const friends = sortedFriends.filter((friend) => {
-    const conversation = conversationForFriend(friend.id);
-    const preview = conversation?.last_message?.body ||
-      conversation?.last_message?.attachment?.name || '';
-    return !filter || `${friend.name || ''} ${preview}`.toLowerCase().includes(filter);
-  });
-  friendList.innerHTML = friends.length
-    ? friends.map((friend) => {
-      const conversation = conversationForFriend(friend.id);
+  friendList.innerHTML = entries.length
+    ? entries.map(({ kind, friend, conversation }) => {
+      if (kind === 'group') return renderGroupListItem(conversation);
       const unreadCount = Number(conversation?.unread_count) || 0;
       const lastMessage = conversation?.last_message;
       const preview = lastMessage?.body || lastMessage?.attachment?.name || 'Start a conversation';
@@ -579,9 +628,25 @@ function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.f
           </span>
         </button>`;
     }).join('')
-    : state.friends.length
+    : state.friends.length || state.conversations.some((conversation) => conversation.type === 'group')
       ? '<div class="empty-list">No friends match your search.</div>'
-      : '<div class="empty-list">Your accepted friends will appear here. Select Add to invite someone.</div>';
+      : '<div class="empty-list">Your friends and groups will appear here. Select Add or Group to get started.</div>';
+}
+
+function renderGroupListItem(conversation) {
+  const unreadCount = Number(conversation.unread_count) || 0;
+  const lastMessage = conversation.last_message;
+  const preview = lastMessage
+    ? `${lastMessage.sender?.name ? `${lastMessage.sender.name}: ` : ''}${lastMessage.body || lastMessage.attachment?.name || 'Attachment'}`
+    : `${conversation.participants?.length || 0} members`;
+  return `
+    <button class="friend-item group-item ${String(selectedConversation()?.id) === String(conversation.id) ? 'active' : ''} ${unreadCount ? 'has-unread' : ''}" type="button" data-action="open-conversation" data-id="${escapeHtml(conversation.id)}" aria-label="Open group ${escapeHtml(conversation.name)}${unreadCount ? `, ${unreadCount} unread messages` : ''}">
+      ${conversationAvatar(conversation)}
+      <span class="person-info"><span class="person-name">${escapeHtml(conversation.name)}</span><span class="conversation-preview">${escapeHtml(preview)}</span></span>
+      <span class="conversation-meta">${lastMessage ? formattedTime(lastMessage.created_at) : ''}
+        ${unreadCount ? `<span class="counter">${escapeHtml(unreadCount)}</span>` : ''}
+      </span>
+    </button>`;
 }
 
 function renderThread() {
@@ -601,11 +666,11 @@ function renderThread() {
   panel.innerHTML = `
     <header class="chat-header">
       <button class="icon-button back-to-friends" type="button" data-action="show-friends" title="Back to friends" aria-label="Back to friends">‹</button>
-      ${friendAvatar(conversation.friend, 'lg', true)}
-      <div class="chat-heading"><h2>${escapeHtml(conversation.friend?.name)}</h2><p id="chat-status">${presenceText(conversation.friend?.id)}</p></div>
+      ${conversationAvatar(conversation, 'lg', conversation.type !== 'group')}
+      <div class="chat-heading"><h2>${escapeHtml(conversationTitle(conversation))}</h2><p id="chat-status">${conversation.type === 'group' ? `${conversation.participants?.length || 0} members` : presenceText(conversation.friend?.id)}</p></div>
       <div class="chat-actions">
-        <button class="icon-button" type="button" data-action="call-audio" title="Start voice call" aria-label="Start voice call" ${state.joinedRoomId ? '' : 'disabled'}>☎</button>
-        <button class="icon-button" type="button" data-action="call-video" title="Start video call" aria-label="Start video call" ${state.joinedRoomId ? '' : 'disabled'}>▣</button>
+        <button class="icon-button" type="button" data-action="call-audio" title="Start voice call" aria-label="Start voice call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}>☎</button>
+        <button class="icon-button" type="button" data-action="call-video" title="Start video call" aria-label="Start video call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}>▣</button>
         <button class="icon-button" type="button" data-action="refresh" title="Refresh messages" aria-label="Refresh messages">↻</button>
       </div>
     </header>
@@ -624,7 +689,7 @@ function renderThread() {
         <button class="attach-button" type="button" data-action="choose-attachment" aria-label="Attach a file" title="Attach a file">＋</button>
         <button class="send-button" type="submit" aria-label="Send message">➤</button>
       </form>
-      <p class="composer-hint" id="attachment-status" aria-live="polite">Press Enter to send · Shift + Enter for a new line. Images, documents, spreadsheets, and ZIP files · 5 MiB max.</p>
+      <p class="composer-hint" id="attachment-status" aria-live="polite">Press Enter to send · Shift + Enter for a new line · Paste an image to attach · 5 MiB max.</p>
     </div>`;
   renderMessages();
 }
@@ -652,9 +717,10 @@ function renderCallOverlay() {
         <span class="call-status">${escapeHtml(call.connectionStatus || (call.phase === 'active' ? 'Connected' : call.phase === 'connecting' ? 'Connecting…' : incoming ? 'Ringing' : 'Waiting'))}</span>
       </header>
       ${video ? `<div class="call-video-grid">
-        <video id="call-remote-video" autoplay controls playsinline></video>
+        <video id="call-remote-video" autoplay muted playsinline></video>
         <video id="call-local-video" autoplay muted playsinline></video>
-      </div>` : '<div class="call-avatar" aria-hidden="true">☎</div><audio id="call-remote-audio" autoplay controls></audio>'}
+      </div>` : '<div class="call-avatar" aria-hidden="true">☎</div>'}
+      <audio id="call-remote-audio" autoplay controls aria-label="Friend call audio"></audio>
       <footer class="call-controls">
         ${incoming
           ? `<button class="call-control accept" data-call-action="accept">Answer</button><button class="call-control hangup" data-call-action="reject">Decline</button>`
@@ -674,6 +740,8 @@ function renderCallOverlay() {
   const remoteAudio = overlay.querySelector('#call-remote-audio');
   if (remoteAudio && state.remoteStream) {
     remoteAudio.srcObject = state.remoteStream;
+    remoteAudio.muted = false;
+    remoteAudio.volume = 1;
     playRemoteMedia(remoteAudio);
   }
 }
@@ -682,7 +750,7 @@ function playRemoteMedia(element) {
   element.play().catch((error) => {
     if (error.name === 'AbortError' || !state.call || state.call.playbackWarningShown) return;
     state.call.playbackWarningShown = true;
-    showNotice('Incoming media could not start automatically. Press Play in the call controls to hear or see your friend.');
+    showNotice('Incoming audio could not start automatically. Press Play in the call controls to hear your friend.');
   });
 }
 
@@ -712,7 +780,7 @@ function renderMessages() {
       : null;
     return `${divider}
       <div class="message-row ${isMine ? 'mine' : ''}">
-        ${isMine ? '' : friendAvatar(selectedConversation()?.friend, 'message-avatar')}
+        ${isMine ? '' : messageAvatar(message)}
         <div class="message-bubble">
           ${message.body ? `<div class="message-text">${escapeHtml(message.body)}</div>` : ''}
           ${imagePreview ? `<img class="message-image" src="${escapeHtml(imagePreview)}" alt="${escapeHtml(message.attachment.name)}" loading="lazy" decoding="async">` : ''}
@@ -811,6 +879,15 @@ async function refreshData() {
 }
 
 function presenceText(userId) {
+  const conversation = selectedConversation();
+  if (conversation?.type === 'group') {
+    if (state.typingUserId) {
+      const typingUser = conversation.participants?.find((participant) =>
+        String(participant.id) === String(state.typingUserId));
+      if (typingUser) return `${typingUser.name} is typing…`;
+    }
+    return `${conversation.participants?.length || 0} members`;
+  }
   if (!state.socketConnected) return 'Presence unavailable';
   if (String(state.typingUserId) === String(userId)) return 'Typing…';
   return isOnline(userId) ? 'Online' : 'Offline';
@@ -821,8 +898,12 @@ function updatePresenceViews() {
   const conversation = selectedConversation();
   const status = document.querySelector('#chat-status');
   if (status && conversation) {
+    const isTyping = conversation.type === 'group'
+      ? Boolean(state.typingUserId && conversation.participants?.some((participant) =>
+        String(participant.id) === String(state.typingUserId)))
+      : String(state.typingUserId) === String(conversation.friend?.id);
     status.textContent = presenceText(conversation.friend?.id);
-    status.classList.toggle('typing', String(state.typingUserId) === String(conversation.friend?.id));
+    status.classList.toggle('typing', isTyping);
   }
 }
 
@@ -872,6 +953,10 @@ async function startCall(mediaType) {
     showNotice('Wait for the realtime chat connection before starting a call.');
     return;
   }
+  if (conversation.type === 'group') {
+    showNotice('Voice and video calls are not available in group chats.');
+    return;
+  }
   if (state.call) {
     showNotice('Finish the current call before starting another.');
     return;
@@ -906,12 +991,20 @@ async function startCall(mediaType) {
 
 async function createPeerConnection(call, initiator) {
   const localStream = await navigator.mediaDevices.getUserMedia({
-    audio: true,
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
     video: call.mediaType === 'video',
   });
   if (state.call?.id !== call.id) {
     localStream.getTracks().forEach((track) => track.stop());
     return;
+  }
+  if (!localStream.getAudioTracks().some((track) => track.enabled && track.readyState === 'live')) {
+    localStream.getTracks().forEach((track) => track.stop());
+    throw new Error('No active microphone audio track was created. Check microphone permissions and input settings.');
   }
 
   const peer = new RTCPeerConnection({
@@ -1141,7 +1234,10 @@ function handleSocketEvent(event, payload) {
     }
   } else if (event === 'conversation:typing' && selectedConversation() &&
     String(payload?.conversation_id) === String(state.selectedConversationId) &&
-    String(payload?.user_id) === String(selectedConversation().friend?.id)) {
+    (selectedConversation().type === 'group'
+      ? selectedConversation().participants?.some((participant) =>
+        String(participant.id) === String(payload?.user_id))
+      : String(payload?.user_id) === String(selectedConversation().friend?.id))) {
     clearTimeout(state.typingTimeout);
     state.typingUserId = payload.user_id;
     updatePresenceViews();
@@ -1251,6 +1347,28 @@ async function openFriend(friendId) {
   renderMessages();
 }
 
+async function openGroupConversation(conversationId) {
+  const conversation = state.conversations.find((item) =>
+    String(item.id) === String(conversationId) && item.type === 'group');
+  if (!conversation) throw new Error('This group is no longer available.');
+  if (state.activeRoomId && String(state.activeRoomId) !== String(conversation.id)) {
+    window.chatSocket?.leaveConversation(state.activeRoomId);
+    state.activeRoomId = null;
+    state.joinedRoomId = null;
+  }
+  stopLocalTyping();
+  clearTypingIndicator();
+  state.sidebarTool = null;
+  state.selectedConversationId = conversation.id;
+  state.messages = [];
+  state.selectedAttachment = null;
+  clearAttachmentPreview();
+  render();
+  joinSelectedConversation();
+  await loadMessages();
+  renderMessages();
+}
+
 async function handleAuthSubmit(form) {
   const formData = new FormData(form);
   const body = Object.fromEntries(formData.entries());
@@ -1280,6 +1398,25 @@ async function handleAddFriend(form) {
   form.reset();
   await refreshData();
   showNotice('Friend request sent.', 'success');
+}
+
+async function handleCreateGroup(form) {
+  const formData = new FormData(form);
+  const name = formData.get('name')?.toString().trim() || '';
+  const friendIds = formData.getAll('friend_ids').map((id) => Number(id));
+  if (!name) throw new Error('Enter a group title.');
+  if (!friendIds.length) throw new Error('Choose at least one friend to add to the group.');
+  const conversation = await api('/groups', {
+    method: 'POST',
+    body: { name, friend_ids: friendIds },
+  });
+  state.sidebarTool = null;
+  state.groupName = '';
+  state.selectedGroupFriendIds.clear();
+  state.conversations = sortConversationsByLatest([...state.conversations, conversation]);
+  await refreshData();
+  await openGroupConversation(conversation.id);
+  showNotice('Group created.', 'success');
 }
 
 async function handleRequestResponse(button) {
@@ -1348,8 +1485,53 @@ function updateAttachmentStatus() {
   if (status) {
     status.textContent = state.selectedAttachment
       ? 'Ready to send · 5 MiB max.'
-      : 'Press Enter to send · Shift + Enter for a new line. Images, documents, spreadsheets, and ZIP files · 5 MiB max.';
+      : 'Press Enter to send · Shift + Enter for a new line · Paste an image to attach · 5 MiB max.';
   }
+}
+
+function selectAttachment(file) {
+  if (!file) return;
+  if (!isAllowedAttachment(file)) {
+    showNotice('Choose an image, document, spreadsheet, or ZIP file.');
+    return;
+  }
+  if (file.size > MAX_ATTACHMENT_SIZE) {
+    showNotice('Attachments must be 5 MiB or smaller.');
+    return;
+  }
+  state.selectedAttachment = file;
+  const attachmentInput = document.querySelector('#attachment-input');
+  if (attachmentInput) attachmentInput.value = '';
+  renderAttachmentPreview(file);
+  updateAttachmentStatus();
+}
+
+function pastedImageFile(clipboardData) {
+  const image = Array.from(clipboardData?.items || [])
+    .find((item) => item.kind === 'file' && item.type.startsWith('image/'))
+    ?.getAsFile();
+  if (!image) return null;
+
+  const extensionByMime = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/gif': 'gif',
+    'image/webp': 'webp',
+    'image/bmp': 'bmp',
+    'image/tiff': 'tiff',
+    'image/avif': 'avif',
+    'image/heic': 'heic',
+    'image/heif': 'heif',
+  };
+  const extension = extensionByMime[image.type.toLowerCase()];
+  if (!extension) {
+    throw new Error('This pasted image format is not supported. Save it as PNG or JPEG and try again.');
+  }
+
+  return new File([image], `PITBConnect-snippet-${Date.now()}.${extension}`, {
+    type: image.type,
+    lastModified: Date.now(),
+  });
 }
 
 function clearAttachmentPreview() {
@@ -1546,6 +1728,7 @@ app.addEventListener('submit', async (event) => {
       connectSocket();
     }
     if (form.id === 'add-friend-form') await handleAddFriend(form);
+    if (form.id === 'create-group-form') await handleCreateGroup(form);
     if (form.id === 'message-form') await handleSendMessage(form);
   } catch (error) {
     showNotice(error.message || 'Something went wrong. Please try again.');
@@ -1619,6 +1802,8 @@ app.addEventListener('click', async (event) => {
       await handleRequestResponse(button);
     } else if (action === 'open-friend') {
       await openFriend(id);
+    } else if (action === 'open-conversation') {
+      await openGroupConversation(id);
     }
   } catch (error) {
     showNotice(error.message || 'Something went wrong. Please try again.');
@@ -1648,10 +1833,17 @@ app.addEventListener('input', (event) => {
   if (event.target.id === 'friend-phone') {
     state.addFriendPhone = event.target.value;
   }
+  if (event.target.id === 'group-name') state.groupName = event.target.value;
   if (event.target.matches('#message-form textarea')) handleMessageTyping();
 });
 
 app.addEventListener('change', (event) => {
+  if (event.target.matches('#create-group-form input[name="friend_ids"]')) {
+    const friendId = String(event.target.value);
+    if (event.target.checked) state.selectedGroupFriendIds.add(friendId);
+    else state.selectedGroupFriendIds.delete(friendId);
+    return;
+  }
   if (event.target.id === 'profile-picture-input') {
     const file = event.target.files?.[0] || null;
     event.target.value = '';
@@ -1664,23 +1856,20 @@ app.addEventListener('change', (event) => {
 
   if (event.target.id !== 'attachment-input') return;
   const file = event.target.files?.[0] || null;
-  if (file && !isAllowedAttachment(file)) {
-    event.target.value = '';
-    state.selectedAttachment = null;
-    updateAttachmentStatus();
-    showNotice('Choose an image, document, spreadsheet, or ZIP file.');
-    return;
+  if (file) selectAttachment(file);
+});
+
+app.addEventListener('paste', (event) => {
+  if (!event.target.matches('#message-form textarea')) return;
+  try {
+    const file = pastedImageFile(event.clipboardData);
+    if (!file) return;
+    event.preventDefault();
+    selectAttachment(file);
+  } catch (error) {
+    event.preventDefault();
+    showNotice(error.message || 'The pasted image could not be attached.');
   }
-  if (file && file.size > MAX_ATTACHMENT_SIZE) {
-    event.target.value = '';
-    state.selectedAttachment = null;
-    updateAttachmentStatus();
-    showNotice('Attachments must be 5 MiB or smaller.');
-    return;
-  }
-  state.selectedAttachment = file;
-  renderAttachmentPreview(file);
-  updateAttachmentStatus();
 });
 
 app.addEventListener('keydown', (event) => {

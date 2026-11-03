@@ -18,7 +18,7 @@ module.exports = {
   packagerConfig: {
     asar: true,
     executableName: 'PITBConnect',
-    tmpdir: path.join(__dirname, 'out', '.packager-tmp'),
+    tmpdir: path.join(__dirname, 'out', '.packager-tmp', `build-${process.pid}`),
   },
   rebuildConfig: {},
   makers: [
