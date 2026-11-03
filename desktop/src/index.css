@@ -230,6 +230,16 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .friend-item .person-info { flex: 1; }
 .conversation-preview { display: block; overflow: hidden; max-width: 190px; margin-top: 5px; color: #7d8d95; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-meta { display: grid; justify-items: end; align-self: stretch; padding-top: 3px; color: #8ea0a6; font-size: 10px; }
+.group-member-panel { padding: 12px 22px 0; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.24); }
+.group-member-panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; color: #5d6f70; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.group-member-count { display: inline-grid; place-items: center; min-width: 22px; height: 22px; padding: 0 7px; border-radius: 999px; color: var(--green-dark); background: var(--green-soft); font-size: 10px; }
+.group-member-list { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 12px; }
+.group-member-chip { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px 7px 12px; border: 1px solid #e3ebe7; border-radius: 999px; background: rgba(255,255,255,.75); box-shadow: 0 4px 10px rgba(16, 34, 30, .02); }
+.group-member-name { color: #3f4d4a; font-size: 12px; font-weight: 600; }
+.group-member-role { padding: 3px 7px; border-radius: 999px; color: var(--green-dark); background: #ebf8f2; font-size: 10px; font-weight: 700; }
+.group-member-remove { display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; color: #983f3f; background: #fdf1f1; font-size: 14px; cursor: pointer; }
+.group-member-remove:hover { background: #fde8e8; }
+.small-button.danger { color: #b75d5d; background: #fef1f0; }
 .profile { display: flex; align-items: center; gap: 10px; min-height: 72px; margin-top: auto; padding: 13px 17px; border-top: 1px solid var(--line); background: rgba(255,255,255,.38); }
 .profile .person-info { flex: 1; }
 .logout-button { padding: 7px 9px; border: 0; border-radius: 8px; color: #5f6e76; background: #eef3f5; font-size: 10px; font-weight: 700; }

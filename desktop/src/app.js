@@ -465,6 +465,19 @@ function conversationTitle(conversation) {
     : conversation?.friend?.name || 'Conversation';
 }
 
+function participantNames(conversation, limit = 5) {
+  const names = Array.isArray(conversation?.participants)
+    ? conversation.participants
+        .map((participant) => participant?.name)
+        .filter(Boolean)
+    : [];
+
+  if (!names.length) return '';
+  const visible = names.slice(0, limit);
+  const extra = Math.max(0, names.length - visible.length);
+  return extra > 0 ? `${visible.join(', ')}, +${extra} more` : visible.join(', ');
+}
+
 function conversationAvatar(conversation, size = 'sm', withPresence = false) {
   if (conversation?.type !== 'group') {
     return friendAvatar(conversation?.friend, size, withPresence);
@@ -639,8 +652,10 @@ function renderGroupListItem(conversation) {
   const preview = lastMessage
     ? `${lastMessage.sender?.name ? `${lastMessage.sender.name}: ` : ''}${lastMessage.body || lastMessage.attachment?.name || 'Attachment'}`
     : `${conversation.participants?.length || 0} members`;
+  const memberNames = participantNames(conversation);
+  const tooltip = memberNames ? `Members: ${memberNames}` : 'Group members';
   return `
-    <button class="friend-item group-item ${String(selectedConversation()?.id) === String(conversation.id) ? 'active' : ''} ${unreadCount ? 'has-unread' : ''}" type="button" data-action="open-conversation" data-id="${escapeHtml(conversation.id)}" aria-label="Open group ${escapeHtml(conversation.name)}${unreadCount ? `, ${unreadCount} unread messages` : ''}">
+    <button class="friend-item group-item ${String(selectedConversation()?.id) === String(conversation.id) ? 'active' : ''} ${unreadCount ? 'has-unread' : ''}" type="button" data-action="open-conversation" data-id="${escapeHtml(conversation.id)}" aria-label="Open group ${escapeHtml(conversation.name)}${unreadCount ? `, ${unreadCount} unread messages` : ''}" title="${escapeHtml(tooltip)}">
       ${conversationAvatar(conversation)}
       <span class="person-info"><span class="person-name">${escapeHtml(conversation.name)}</span><span class="conversation-preview">${escapeHtml(preview)}</span></span>
       <span class="conversation-meta">${lastMessage ? formattedTime(lastMessage.created_at) : ''}
@@ -663,17 +678,38 @@ function renderThread() {
     return;
   }
 
+  const groupMembers = conversation.type === 'group' ? (conversation.participants || []).filter((member) => member && member.id) : [];
   panel.innerHTML = `
     <header class="chat-header">
       <button class="icon-button back-to-friends" type="button" data-action="show-friends" title="Back to friends" aria-label="Back to friends">‹</button>
       ${conversationAvatar(conversation, 'lg', conversation.type !== 'group')}
-      <div class="chat-heading"><h2>${escapeHtml(conversationTitle(conversation))}</h2><p id="chat-status">${conversation.type === 'group' ? `${conversation.participants?.length || 0} members` : presenceText(conversation.friend?.id)}</p></div>
+      <div class="chat-heading"><h2>${escapeHtml(conversationTitle(conversation))}</h2><p id="chat-status" title="${escapeHtml(conversation.type === 'group' ? `Members: ${participantNames(conversation) || 'No members yet'}` : presenceText(conversation.friend?.id))}">${conversation.type === 'group' ? `${conversation.participants?.length || 0} members${participantNames(conversation) ? ` • ${escapeHtml(participantNames(conversation))}` : ''}` : presenceText(conversation.friend?.id)}</p></div>
       <div class="chat-actions">
+        <button class="icon-button" type="button" data-action="unfriend" data-id="${escapeHtml(conversation.friend?.id)}" title="Remove friend" aria-label="Remove ${escapeHtml(conversation.friend?.name || 'friend')}" ${conversation.type === 'group' ? 'hidden' : ''}>✕</button>
         <button class="icon-button" type="button" data-action="call-audio" title="Start voice call" aria-label="Start voice call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}>☎</button>
         <button class="icon-button" type="button" data-action="call-video" title="Start video call" aria-label="Start video call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}>▣</button>
+        <button class="icon-button" type="button" data-action="leave-group" data-id="${escapeHtml(conversation.id)}" title="Leave group" aria-label="Leave group" ${conversation.type !== 'group' ? 'hidden' : ''}>↩</button>
         <button class="icon-button" type="button" data-action="refresh" title="Refresh messages" aria-label="Refresh messages">↻</button>
       </div>
     </header>
+    ${conversation.type === 'group' ? `
+      <div class="group-member-panel" aria-label="Group members">
+        <div class="group-member-panel-header">
+          <span>Group members</span>
+          <span class="group-member-count">${groupMembers.length}</span>
+        </div>
+        <div class="group-member-list">
+          ${groupMembers.map((member) => `
+            <div class="group-member-chip">
+              <span class="group-member-name">${escapeHtml(member.name)}</span>
+              ${String(member.id) === String(state.user.id)
+                ? '<span class="group-member-role">You</span>'
+                : `<button class="group-member-remove" type="button" data-action="remove-group-member" data-conversation-id="${escapeHtml(conversation.id)}" data-user-id="${escapeHtml(member.id)}" aria-label="Remove ${escapeHtml(member.name)} from group">×</button>`}
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    ` : ''}
     <div class="message-list" id="message-list"></div>
     <div class="composer-wrap">
       <div class="attachment-preview" id="attachment-preview" aria-live="polite" hidden></div>
@@ -886,7 +922,8 @@ function presenceText(userId) {
         String(participant.id) === String(state.typingUserId));
       if (typingUser) return `${typingUser.name} is typing…`;
     }
-    return `${conversation.participants?.length || 0} members`;
+    const memberNames = participantNames(conversation);
+    return `${conversation.participants?.length || 0} members${memberNames ? ` • ${memberNames}` : ''}`;
   }
   if (!state.socketConnected) return 'Presence unavailable';
   if (String(state.typingUserId) === String(userId)) return 'Typing…';
@@ -1427,6 +1464,52 @@ async function handleRequestResponse(button) {
   showNotice(response === 'accept' ? 'Friend request accepted.' : 'Friend request declined.', 'success');
 }
 
+async function handleUnfriend(friendId) {
+  const friend = state.friends.find((person) => String(person.id) === String(friendId));
+  const friendName = friend?.name || 'this friend';
+  const confirmed = window.confirm(`Remove ${friendName} from your friends list? This will also delete the direct chat.`);
+  if (!confirmed) return;
+
+  await api(`/friends/${encodeURIComponent(friendId)}`, { method: 'DELETE' });
+  state.selectedConversationId = null;
+  state.messages = [];
+  state.activeRoomId = null;
+  state.joinedRoomId = null;
+  await refreshData();
+  showNotice('Friend removed.', 'success');
+}
+
+async function handleLeaveGroup(conversationId) {
+  const conversation = state.conversations.find((item) => String(item.id) === String(conversationId) && item.type === 'group');
+  if (!conversation) throw new Error('This group is no longer available.');
+  const confirmed = window.confirm(`Leave "${conversation.name}"?`);
+  if (!confirmed) return;
+
+  await api(`/groups/${encodeURIComponent(conversationId)}/leave`, { method: 'POST' });
+  state.selectedConversationId = null;
+  state.messages = [];
+  state.activeRoomId = null;
+  state.joinedRoomId = null;
+  await refreshData();
+  showNotice('You left the group.', 'success');
+}
+
+async function handleRemoveGroupMember(conversationId, userId) {
+  const conversation = state.conversations.find((item) => String(item.id) === String(conversationId) && item.type === 'group');
+  if (!conversation) throw new Error('This group is no longer available.');
+  const member = (conversation.participants || []).find((person) => String(person.id) === String(userId));
+  if (!member) throw new Error('This member is no longer in the group.');
+  const confirmed = window.confirm(`Remove ${member.name} from "${conversation.name}"?`);
+  if (!confirmed) return;
+
+  await api(`/groups/${encodeURIComponent(conversationId)}/members/${encodeURIComponent(userId)}`, { method: 'DELETE' });
+  await refreshData();
+  if (String(state.selectedConversationId) === String(conversationId)) {
+    render();
+  }
+  showNotice(`${member.name} was removed from the group.`, 'success');
+}
+
 async function handleSendMessage(form) {
   const field = form.elements.body;
   const body = field.value.trim();
@@ -1800,6 +1883,12 @@ app.addEventListener('click', async (event) => {
       await downloadAttachment(message);
     } else if (action === 'respond-request') {
       await handleRequestResponse(button);
+    } else if (action === 'unfriend') {
+      await handleUnfriend(id);
+    } else if (action === 'leave-group') {
+      await handleLeaveGroup(id);
+    } else if (action === 'remove-group-member') {
+      await handleRemoveGroupMember(button.dataset.conversationId, button.dataset.userId);
     } else if (action === 'open-friend') {
       await openFriend(id);
     } else if (action === 'open-conversation') {
