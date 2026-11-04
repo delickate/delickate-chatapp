@@ -48,6 +48,7 @@ const state = {
   messages: [],
   selectedAttachment: null,
   attachmentPreviewUrl: null,
+  previewImageUrl: null,
   cachedAttachments: new Map(),
   attachmentCachePending: new Set(),
   onlineFriendIds: new Set(),
@@ -426,6 +427,7 @@ function updateControls() {
 }
 
 function render() {
+  closeImagePreview();
   if (!state.token || !state.user) {
     showAuth();
     return;
@@ -688,14 +690,14 @@ function renderThread() {
         <button class="icon-button" type="button" data-action="unfriend" data-id="${escapeHtml(conversation.friend?.id)}" title="Remove friend" aria-label="Remove ${escapeHtml(conversation.friend?.name || 'friend')}" ${conversation.type === 'group' ? 'hidden' : ''}>✕</button>
         <button class="icon-button" type="button" data-action="call-audio" title="Start voice call" aria-label="Start voice call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}>☎</button>
         <button class="icon-button" type="button" data-action="call-video" title="Start video call" aria-label="Start video call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}>▣</button>
-        <button class="icon-button" type="button" data-action="leave-group" data-id="${escapeHtml(conversation.id)}" title="Leave group" aria-label="Leave group" ${conversation.type !== 'group' ? 'hidden' : ''}>↩</button>
+        <button class="icon-button" type="button" data-action="leave-group" data-id="${escapeHtml(conversation.id)}" title="Leave group" aria-label="Leave group" ${conversation.type !== 'group' || String(conversation.created_by) === String(state.user.id) ? 'hidden' : ''}>↩</button>
         <button class="icon-button" type="button" data-action="refresh" title="Refresh messages" aria-label="Refresh messages">↻</button>
       </div>
     </header>
     ${conversation.type === 'group' ? `
       <div class="group-member-panel" aria-label="Group members">
         <div class="group-member-panel-header">
-          <span>Group members</span>
+          <span>${String(conversation.created_by) === String(state.user.id) ? 'Manage group members' : 'Group members'}</span>
           <span class="group-member-count">${groupMembers.length}</span>
         </div>
         <div class="group-member-list">
@@ -703,8 +705,10 @@ function renderThread() {
             <div class="group-member-chip">
               <span class="group-member-name">${escapeHtml(member.name)}</span>
               ${String(member.id) === String(state.user.id)
-                ? '<span class="group-member-role">You</span>'
-                : `<button class="group-member-remove" type="button" data-action="remove-group-member" data-conversation-id="${escapeHtml(conversation.id)}" data-user-id="${escapeHtml(member.id)}" aria-label="Remove ${escapeHtml(member.name)} from group">×</button>`}
+                ? `<span class="group-member-role">${String(conversation.created_by) === String(state.user.id) ? 'Creator' : 'You'}</span>`
+                : String(conversation.created_by) === String(state.user.id)
+                  ? `<button class="group-member-remove" type="button" data-action="remove-group-member" data-conversation-id="${escapeHtml(conversation.id)}" data-user-id="${escapeHtml(member.id)}" aria-label="Remove ${escapeHtml(member.name)} from group">×</button>`
+                  : ''}
             </div>
           `).join('')}
         </div>
@@ -819,13 +823,44 @@ function renderMessages() {
         ${isMine ? '' : messageAvatar(message)}
         <div class="message-bubble">
           ${message.body ? `<div class="message-text">${escapeHtml(message.body)}</div>` : ''}
-          ${imagePreview ? `<img class="message-image" src="${escapeHtml(imagePreview)}" alt="${escapeHtml(message.attachment.name)}" loading="lazy" decoding="async">` : ''}
+          ${imagePreview ? `<button class="message-image-button" type="button" data-action="preview-image" data-image-url="${escapeHtml(imagePreview)}" data-image-name="${escapeHtml(message.attachment.name)}" aria-label="View ${escapeHtml(message.attachment.name)} full size"><img class="message-image" src="${escapeHtml(imagePreview)}" alt="${escapeHtml(message.attachment.name)}" loading="lazy" decoding="async"></button>` : ''}
           ${message.attachment ? `<button class="attachment-download" type="button" data-action="download-attachment" data-message-id="${escapeHtml(message.id)}">${escapeHtml(message.attachment.name)} · ${formatFileSize(message.attachment.size)} · Download</button>` : ''}
           <div class="message-foot"><span>${formattedTime(message.created_at)}</span>${receipt ? `<span>${receipt}</span>` : ''}</div>
         </div>
       </div>`;
   }).join('');
   if (wasNearBottom) list.scrollTop = list.scrollHeight;
+}
+
+function showImagePreview(url, name) {
+  closeImagePreview();
+  state.previewImageUrl = url;
+  const viewer = document.createElement('div');
+  viewer.className = 'image-viewer';
+  viewer.setAttribute('role', 'dialog');
+  viewer.setAttribute('aria-modal', 'true');
+  viewer.setAttribute('aria-label', `Image preview: ${name}`);
+
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'image-viewer-close';
+  close.dataset.action = 'close-image-preview';
+  close.setAttribute('aria-label', 'Close image preview');
+  close.textContent = '×';
+
+  const image = document.createElement('img');
+  image.className = 'image-viewer-full';
+  image.src = url;
+  image.alt = name;
+
+  viewer.append(close, image);
+  app.append(viewer);
+  close.focus();
+}
+
+function closeImagePreview() {
+  state.previewImageUrl = null;
+  app.querySelector('.image-viewer')?.remove();
 }
 
 function syncUnreadIndicators() {
@@ -1819,6 +1854,16 @@ app.addEventListener('submit', async (event) => {
 });
 
 app.addEventListener('click', async (event) => {
+  const imageButton = event.target.closest('[data-action="preview-image"]');
+  if (imageButton) {
+    showImagePreview(imageButton.dataset.imageUrl, imageButton.dataset.imageName || 'Shared image');
+    return;
+  }
+  if (event.target.matches('.image-viewer') ||
+    event.target.closest('[data-action="close-image-preview"]')) {
+    closeImagePreview();
+    return;
+  }
   const picker = document.querySelector('#emoji-picker');
   if (picker && !picker.hidden && !picker.contains(event.target) &&
     !event.target.closest('[data-action="toggle-emoji-picker"]')) {
@@ -1962,6 +2007,10 @@ app.addEventListener('paste', (event) => {
 });
 
 app.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && state.previewImageUrl) {
+    closeImagePreview();
+    return;
+  }
   if (event.key === 'Escape' && !document.querySelector('#emoji-picker')?.hidden) {
     closeEmojiPicker();
   }

@@ -30,13 +30,15 @@ are saved locally for this desktop user. The default socket URL is
 - One-to-one and group chats with paginated message history, send, unread
   counts, and seen/delivered receipt display.
 - Create titled groups with accepted friends. Group membership is enforced by
-  the API and unread counts are tracked separately for each member.
+  the API and unread counts are tracked separately for each member. Only the
+  creator can remove other members; other participants can leave the group.
 - Attach and download JPEG, PNG, GIF, WebP, PDF, and plain-text files (5 MiB
   maximum). The desktop checks the size before sending; Laravel performs the
   authoritative size, type, and content validation.
 - Image attachments are cached per signed-in user in Electron's local
   application data folder on both sender and recipient devices. Cached images
-  appear inline in chat and remain available after restarting the desktop app.
+  appear inline in chat, open in a full-size preview when clicked, and remain
+  available after restarting the desktop app.
 - Paste a copied screenshot or image into the chat message box to attach it;
   it appears in the attachment preview and sends with the message.
 - One-to-one voice and video calls with incoming-call, mute, camera, and
