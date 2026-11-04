@@ -372,17 +372,9 @@ function showAuth() {
   app.innerHTML = `
     <section class="auth-screen">
       <div class="auth-card">
-        <aside class="auth-aside">
-          <div class="brand-lockup"><span class="brand-mark">P</span><span>PITBConnect</span></div>
-          <div class="aside-copy">
-            <h1>Good conversations start here.</h1>
-            <p>A quieter place to catch up with your people, one message at a time.</p>
-          </div>
-          <div class="aside-note">Your conversations, all in one place.</div>
-        </aside>
         <section class="auth-content">
-          <h2>${isSignup ? 'Create your account' : 'Welcome back'}</h2>
-          <p class="auth-lede">${isSignup ? 'A few details and you’re ready to connect.' : 'Sign in to pick up where you left off.'}</p>
+          <div class="brand-lockup"><span class="brand-mark">P</span><span>PITBConnect</span></div>
+          <h2>${isSignup ? 'Create account' : 'Sign in'}</h2>
           <form id="auth-form" class="form-grid">
             ${isSignup ? `
               <div class="field"><label for="name">Full name</label><input id="name" name="name" autocomplete="name" maxlength="120" placeholder="Your name" required /></div>
@@ -392,23 +384,22 @@ function showAuth() {
               <div class="field"><label for="email">Email</label><input id="email" name="email" type="email" autocomplete="email" maxlength="254" placeholder="you@example.com" required /></div>
               <div class="field"><label for="dob">Date of birth</label><input id="dob" name="dob" type="date" max="${new Date().toISOString().slice(0, 10)}" required /></div>
             ` : ''}
-            <div class="field"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="${isSignup ? 'new-password' : 'current-password'}" minlength="${isSignup ? 8 : 1}" maxlength="128" placeholder="${isSignup ? 'At least 8 characters' : 'Your password'}" required /></div>
+            <div class="field">
+              <label for="password">Password</label>
+              <div class="password-input-wrap">
+                <input id="password" name="password" type="password" autocomplete="${isSignup ? 'new-password' : 'current-password'}" minlength="${isSignup ? 8 : 1}" maxlength="128" placeholder="${isSignup ? 'At least 8 characters' : 'Your password'}" required />
+                <button class="password-visibility" type="button" data-action="toggle-password-visibility" aria-label="Show password" title="Show password" aria-pressed="false">
+                  <svg class="password-eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18"/><path d="M10.6 10.6a2 2 0 0 0 2.8 2.8"/><path d="M9.9 5.2A10.7 10.7 0 0 1 12 5c6.4 0 10 7 10 7a15.7 15.7 0 0 1-3.1 3.9"/><path d="M6.2 6.2C3.5 8 2 12 2 12s3.6 7 10 7a10.5 10.5 0 0 0 4-.8"/></svg>
+                  <svg class="password-eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>
+                </button>
+              </div>
+            </div>
             <button class="primary-button auth-submit" type="submit">${isSignup ? 'Create account' : 'Sign in'}</button>
           </form>
           <p class="switch-auth">
-            ${isSignup ? 'Already have an account?' : 'New to PITBConnect?'}
-            <button class="text-button" type="button" data-action="toggle-auth">${isSignup ? 'Sign in' : 'Create account'}</button>
+            ${isSignup ? 'Already registered?' : 'Don’t have an account?'}
+            <button class="text-button" type="button" data-action="toggle-auth">${isSignup ? 'Sign in' : 'Register'}</button>
           </p>
-          <details class="api-settings">
-            <summary>API connection settings</summary>
-            <form id="api-settings-form">
-              <label class="settings-field">Laravel API URL<input name="apiUrl" type="url" value="${escapeHtml(state.apiUrl)}" required /></label>
-              <label class="settings-field">Socket.IO URL<input name="socketUrl" type="url" value="${escapeHtml(state.socketUrl)}" required /></label>
-              <button class="small-button" type="submit">Save</button>
-            </form>
-            <div>API URL ends with <code>/api</code>; socket URL is the server origin.</div>
-          </details>
-          ${updateControls()}
         </section>
       </div>
     </section>`;
@@ -513,15 +504,15 @@ function showChatShell() {
         <div class="friend-list-heading"><h2>Friends</h2><span class="unread-total" id="unread-message-count" hidden></span></div>
         <div class="friend-list" id="friend-list"></div>
         <div class="profile">
-          <button class="profile-avatar-button" type="button" data-action="choose-profile-picture" aria-label="Update profile picture" title="Update profile picture">
+          <button class="profile-avatar-button" type="button" data-action="open-profile" aria-label="Open profile" title="Open profile">
             ${friendAvatar(state.user, 'sm')}
           </button>
           <div class="person-info"><div class="person-name">${escapeHtml(state.user.name)}</div><div class="person-sub">${escapeHtml(state.user.phone)}</div></div>
           <button class="logout-button" type="button" data-action="logout">Sign out</button>
         </div>
-        <input id="profile-picture-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
       </aside>
       <section class="chat-panel" id="chat-panel"></section>
+      <div id="modal-root"></div>
     </div>`;
 
   renderSidebar();
@@ -685,35 +676,15 @@ function renderThread() {
     <header class="chat-header">
       <button class="icon-button back-to-friends" type="button" data-action="show-friends" title="Back to friends" aria-label="Back to friends">‹</button>
       ${conversationAvatar(conversation, 'lg', conversation.type !== 'group')}
-      <div class="chat-heading"><h2>${escapeHtml(conversationTitle(conversation))}</h2><p id="chat-status" title="${escapeHtml(conversation.type === 'group' ? `Members: ${participantNames(conversation) || 'No members yet'}` : presenceText(conversation.friend?.id))}">${conversation.type === 'group' ? `${conversation.participants?.length || 0} members${participantNames(conversation) ? ` • ${escapeHtml(participantNames(conversation))}` : ''}` : presenceText(conversation.friend?.id)}</p></div>
+      <div class="chat-heading"><h2>${escapeHtml(conversationTitle(conversation))}</h2><p id="chat-status" title="${escapeHtml(conversation.type === 'group' ? `${groupMembers.length} group members` : presenceText(conversation.friend?.id))}">${conversation.type === 'group' ? `${groupMembers.length} members` : presenceText(conversation.friend?.id)}</p></div>
       <div class="chat-actions">
+        ${conversation.type === 'group' ? `<button class="icon-button group-members-button" type="button" data-action="open-group-members" data-id="${escapeHtml(conversation.id)}" title="View group members" aria-label="View ${groupMembers.length} group members"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 19v-1a6 6 0 0 1 12 0v1"/><path d="M16 5.5a3 3 0 0 1 0 5.8M18 14a5 5 0 0 1 3 4.5v.5"/></svg><span class="group-member-count">${groupMembers.length}</span></button>` : ''}
         <button class="icon-button" type="button" data-action="unfriend" data-id="${escapeHtml(conversation.friend?.id)}" title="Remove friend" aria-label="Remove ${escapeHtml(conversation.friend?.name || 'friend')}" ${conversation.type === 'group' ? 'hidden' : ''}>✕</button>
         <button class="icon-button" type="button" data-action="call-audio" title="Start voice call" aria-label="Start voice call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}>☎</button>
         <button class="icon-button" type="button" data-action="call-video" title="Start video call" aria-label="Start video call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}>▣</button>
-        <button class="icon-button" type="button" data-action="leave-group" data-id="${escapeHtml(conversation.id)}" title="Leave group" aria-label="Leave group" ${conversation.type !== 'group' || String(conversation.created_by) === String(state.user.id) ? 'hidden' : ''}>↩</button>
         <button class="icon-button" type="button" data-action="refresh" title="Refresh messages" aria-label="Refresh messages">↻</button>
       </div>
     </header>
-    ${conversation.type === 'group' ? `
-      <div class="group-member-panel" aria-label="Group members">
-        <div class="group-member-panel-header">
-          <span>${String(conversation.created_by) === String(state.user.id) ? 'Manage group members' : 'Group members'}</span>
-          <span class="group-member-count">${groupMembers.length}</span>
-        </div>
-        <div class="group-member-list">
-          ${groupMembers.map((member) => `
-            <div class="group-member-chip">
-              <span class="group-member-name">${escapeHtml(member.name)}</span>
-              ${String(member.id) === String(state.user.id)
-                ? `<span class="group-member-role">${String(conversation.created_by) === String(state.user.id) ? 'Creator' : 'You'}</span>`
-                : String(conversation.created_by) === String(state.user.id)
-                  ? `<button class="group-member-remove" type="button" data-action="remove-group-member" data-conversation-id="${escapeHtml(conversation.id)}" data-user-id="${escapeHtml(member.id)}" aria-label="Remove ${escapeHtml(member.name)} from group">×</button>`
-                  : ''}
-            </div>
-          `).join('')}
-        </div>
-      </div>
-    ` : ''}
     <div class="message-list" id="message-list"></div>
     <div class="composer-wrap">
       <div class="attachment-preview" id="attachment-preview" aria-live="polite" hidden></div>
@@ -732,6 +703,57 @@ function renderThread() {
       <p class="composer-hint" id="attachment-status" aria-live="polite">Press Enter to send · Shift + Enter for a new line · Paste an image to attach · 5 MiB max.</p>
     </div>`;
   renderMessages();
+}
+
+function renderProfileModal() {
+  const modalRoot = document.querySelector('#modal-root');
+  if (!modalRoot || !state.user) return;
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <section class="app-modal profile-modal" role="dialog" aria-modal="true" aria-labelledby="profile-modal-title">
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Close profile">×</button>
+        <h2 id="profile-modal-title">Your profile</h2>
+        <div class="profile-modal-avatar">${friendAvatar(state.user, 'lg')}</div>
+        <div class="profile-modal-name">${escapeHtml(state.user.name)}</div>
+        <div class="profile-modal-phone">${escapeHtml(state.user.phone)}</div>
+        <button class="primary-button profile-change-button" type="button" data-action="choose-profile-picture">Change profile picture</button>
+        <input id="profile-picture-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+      </section>
+    </div>`;
+}
+
+function renderGroupMembersModal(conversation) {
+  const modalRoot = document.querySelector('#modal-root');
+  if (!modalRoot || conversation?.type !== 'group') return;
+  const members = (conversation.participants || []).filter((member) => member && member.id);
+  const isCreator = String(conversation.created_by) === String(state.user.id);
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <section class="app-modal group-modal" role="dialog" aria-modal="true" aria-labelledby="group-modal-title">
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Close group members">×</button>
+        <h2 id="group-modal-title">${isCreator ? 'Manage group members' : 'Group members'}</h2>
+        <p class="modal-subtitle">${escapeHtml(conversation.name || 'Group')} · ${members.length} members</p>
+        <div class="modal-member-list">
+          ${members.map((member) => `
+            <div class="modal-member-row">
+              ${friendAvatar(member, 'sm')}
+              <span class="modal-member-name">${escapeHtml(member.name)}</span>
+              ${String(member.id) === String(state.user.id)
+                ? `<span class="group-member-role">${isCreator ? 'Creator' : 'You'}</span>`
+                : isCreator
+                  ? `<button class="group-member-remove" type="button" data-action="remove-group-member" data-conversation-id="${escapeHtml(conversation.id)}" data-user-id="${escapeHtml(member.id)}" aria-label="Remove ${escapeHtml(member.name)} from group" title="Remove member">×</button>`
+                  : ''}
+            </div>
+          `).join('')}
+        </div>
+        ${!isCreator ? `<button class="group-leave-modal" type="button" data-action="leave-group" data-id="${escapeHtml(conversation.id)}">Leave group</button>` : ''}
+      </section>
+    </div>`;
+}
+
+function closeModal() {
+  const modalRoot = document.querySelector('#modal-root');
+  if (modalRoot) modalRoot.replaceChildren();
 }
 
 function renderCallOverlay() {
@@ -1521,6 +1543,7 @@ async function handleLeaveGroup(conversationId) {
   if (!confirmed) return;
 
   await api(`/groups/${encodeURIComponent(conversationId)}/leave`, { method: 'POST' });
+  closeModal();
   state.selectedConversationId = null;
   state.messages = [];
   state.activeRoomId = null;
@@ -1540,7 +1563,13 @@ async function handleRemoveGroupMember(conversationId, userId) {
   await api(`/groups/${encodeURIComponent(conversationId)}/members/${encodeURIComponent(userId)}`, { method: 'DELETE' });
   await refreshData();
   if (String(state.selectedConversationId) === String(conversationId)) {
-    render();
+    const updatedConversation = state.conversations.find((item) => String(item.id) === String(conversationId));
+    if (updatedConversation) {
+      renderThread();
+      renderGroupMembersModal(updatedConversation);
+    } else {
+      closeModal();
+    }
   }
   showNotice(`${member.name} was removed from the group.`, 'success');
 }
@@ -1739,6 +1768,7 @@ async function updateProfilePicture(file) {
   state.user = payload.user;
   localStorage.setItem(USER_KEY, JSON.stringify(payload.user));
   render();
+  renderProfileModal();
   showNotice('Profile picture updated.', 'success');
 }
 
@@ -1854,6 +1884,10 @@ app.addEventListener('submit', async (event) => {
 });
 
 app.addEventListener('click', async (event) => {
+  if (event.target.matches('.modal-backdrop')) {
+    closeModal();
+    return;
+  }
   const imageButton = event.target.closest('[data-action="preview-image"]');
   if (imageButton) {
     showImagePreview(imageButton.dataset.imageUrl, imageButton.dataset.imageName || 'Shared image');
@@ -1873,7 +1907,16 @@ app.addEventListener('click', async (event) => {
   if (!button) return;
   const { action, id } = button.dataset;
   try {
-    if (action === 'toggle-auth') {
+    if (action === 'toggle-password-visibility') {
+      const password = document.querySelector('#password');
+      const visible = password.type === 'password';
+      password.type = visible ? 'text' : 'password';
+      button.setAttribute('aria-label', visible ? 'Hide password' : 'Show password');
+      button.setAttribute('title', visible ? 'Hide password' : 'Show password');
+      button.setAttribute('aria-pressed', String(visible));
+      button.classList.toggle('is-visible', visible);
+      password.focus();
+    } else if (action === 'toggle-auth') {
       state.authMode = state.authMode === 'login' ? 'signup' : 'login';
       render();
     } else if (action === 'toggle-sidebar-tool') {
@@ -1882,6 +1925,15 @@ app.addEventListener('click', async (event) => {
       if (state.sidebarTool === 'search') {
         document.querySelector('#friend-search')?.focus();
       }
+    } else if (action === 'open-profile') {
+      renderProfileModal();
+    } else if (action === 'open-group-members') {
+      const conversation = state.conversations.find((item) =>
+        String(item.id) === String(id) && item.type === 'group');
+      if (!conversation) throw new Error('This group is no longer available.');
+      renderGroupMembersModal(conversation);
+    } else if (action === 'close-modal') {
+      closeModal();
     } else if (action === 'choose-profile-picture') {
       document.querySelector('#profile-picture-input')?.click();
     } else if (action === 'check-updates') {
@@ -2007,6 +2059,10 @@ app.addEventListener('paste', (event) => {
 });
 
 app.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && document.querySelector('.modal-backdrop')) {
+    closeModal();
+    return;
+  }
   if (event.key === 'Escape' && state.previewImageUrl) {
     closeImagePreview();
     return;

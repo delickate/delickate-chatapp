@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, session, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, session, shell } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { io } = require('socket.io-client');
@@ -365,6 +365,7 @@ const createWindow = () => {
     minWidth: 900,
     minHeight: 620,
     backgroundColor: '#f4f7f6',
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -373,6 +374,7 @@ const createWindow = () => {
     },
   });
 
+  mainWindow.setMenuBarVisibility(false);
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.on('focus', () => {
@@ -387,6 +389,7 @@ const createWindow = () => {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
+  Menu.setApplicationMenu(null);
   let mediaPermissionGranted = false;
   const requestMediaPermission = () => new Promise((resolve) => {
     if (!mainWindow || mainWindow.isDestroyed()) {
