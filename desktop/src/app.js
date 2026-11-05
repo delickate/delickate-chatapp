@@ -49,7 +49,6 @@ const state = {
   messages: [],
   replyTarget: null,
   selectedAttachment: null,
-  attachmentPreviewUrl: null,
   previewImageUrl: null,
   cachedAttachments: new Map(),
   attachmentCachePending: new Set(),
@@ -136,6 +135,36 @@ function escapeHtml(value) {
     '"': '&quot;',
     "'": '&#39;',
   })[character]);
+}
+
+function linkifyMessageText(value) {
+  const text = String(value ?? '');
+  const urlPattern = /(?:https?:\/\/|www\.)[^\s<>"']+|(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?::\d{1,5})?(?:[/?#][^\s<>"']*)?/gi;
+  let html = '';
+  let lastIndex = 0;
+  let match;
+
+  while ((match = urlPattern.exec(text)) !== null) {
+    let url = match[0];
+    let trailing = '';
+    while (/[),.!?;:]$/.test(url)) {
+      trailing = url.slice(-1) + trailing;
+      url = url.slice(0, -1);
+    }
+
+    let normalizedUrl;
+    try {
+      normalizedUrl = new URL(/^https?:\/\//i.test(url) ? url : `https://${url}`).href;
+    } catch {
+      continue;
+    }
+    if (!/^https?:$/.test(new URL(normalizedUrl).protocol)) continue;
+
+    html += `${escapeHtml(text.slice(lastIndex, match.index))}<a class="message-link" href="#" data-action="open-external-link" data-url="${escapeHtml(normalizedUrl)}">${escapeHtml(url)}</a>${escapeHtml(trailing)}`;
+    lastIndex = match.index + match[0].length;
+  }
+
+  return html + escapeHtml(text.slice(lastIndex));
 }
 
 function initials(name) {
@@ -228,7 +257,7 @@ async function api(path, options = {}) {
       body: options.body === undefined || isMultipart ? options.body : JSON.stringify(options.body),
     });
   } catch {
-    throw new Error(`Can't reach the API at ${state.apiUrl}. Check the backend and API address.`);
+    throw new Error('API server is not reachable. Please check your internet connection and try again.');
   }
 
   const payload = await response.json().catch(() => ({}));
@@ -265,7 +294,7 @@ async function fetchAttachmentBlob(conversationId, messageId) {
       { headers: { Accept: 'application/octet-stream', Authorization: `Bearer ${state.token}` } },
     );
   } catch {
-    throw new Error(`Can't reach the API at ${state.apiUrl}. Check the backend and API address.`);
+    throw new Error('API server is not reachable. Please check your internet connection and try again.');
   }
 
   if (!response.ok) {
@@ -704,7 +733,6 @@ function renderThread() {
         <button class="attach-button" type="button" data-action="choose-attachment" aria-label="Attach a file" title="Attach a file">＋</button>
         <button class="send-button" type="submit" aria-label="Send message">➤</button>
       </form>
-      <p class="composer-hint" id="attachment-status" aria-live="polite">Press Enter to send · Shift + Enter for a new line · Paste an image to attach · 5 MiB max.</p>
     </div>`;
   renderMessages();
   updateReplyPreview();
@@ -885,15 +913,18 @@ function renderMessages() {
         <div class="message-bubble">
           ${replyPreview}
           ${isDeleted ? '<div class="message-deleted">This message was deleted</div>' : ''}
-          ${!isDeleted && message.body ? `<div class="message-text">${escapeHtml(message.body)}</div>` : ''}
+          ${!isDeleted && message.body ? `<div class="message-text">${linkifyMessageText(message.body)}</div>` : ''}
           ${!isDeleted && imagePreview ? `<button class="message-image-button" type="button" data-action="preview-image" data-image-url="${escapeHtml(imagePreview)}" data-image-name="${escapeHtml(message.attachment.name)}" aria-label="View ${escapeHtml(message.attachment.name)} full size"><img class="message-image" src="${escapeHtml(imagePreview)}" alt="${escapeHtml(message.attachment.name)}" loading="lazy" decoding="async"></button>` : ''}
           ${!isDeleted && message.attachment ? `<button class="attachment-download" type="button" data-action="download-attachment" data-message-id="${escapeHtml(message.id)}">${escapeHtml(message.attachment.name)} · ${formatFileSize(message.attachment.size)} · Download</button>` : ''}
-          ${!isDeleted ? `<div class="message-actions">
-            <button type="button" data-action="reply-message" data-message-id="${escapeHtml(message.id)}" aria-label="Reply to message" title="Reply">↩</button>
-            <button type="button" data-action="delete-message-for-me" data-message-id="${escapeHtml(message.id)}" aria-label="Delete message for me" title="Delete for me">⌫</button>
-            ${isMine ? `<button type="button" data-action="delete-message-for-everyone" data-message-id="${escapeHtml(message.id)}" aria-label="Delete message for everyone" title="Delete for everyone">×</button>` : ''}
-          </div>` : ''}
-          <div class="message-foot"><span>${formattedTime(message.created_at)}</span>${receipt ? `<span>${receipt}</span>` : ''}</div>
+          ${!isDeleted ? `<details class="message-menu ${isMine ? 'mine' : 'other'}">
+            <summary aria-label="Message options" title="Message options">⋯</summary>
+            <div class="message-menu-items" role="menu" aria-label="Message options">
+              <button type="button" role="menuitem" data-action="reply-message" data-message-id="${escapeHtml(message.id)}">↩ <span>Reply</span></button>
+              <button type="button" role="menuitem" data-action="delete-message-for-me" data-message-id="${escapeHtml(message.id)}">⌫ <span>Delete for me</span></button>
+              ${isMine ? `<button type="button" role="menuitem" data-action="delete-message-for-everyone" data-message-id="${escapeHtml(message.id)}">× <span>Delete for everyone</span></button>` : ''}
+            </div>
+          </details>` : ''}
+          <div class="message-foot"><span>${formattedTime(message.created_at)}${receipt ? ` · ${receipt}` : ''}</span></div>
         </div>
       </div>`;
   }).join('');
@@ -1381,7 +1412,7 @@ function handleSocketEvent(event, payload) {
     if (event === 'connect_error' && payload?.message) {
       const message = payload.message === 'Authentication failed'
         ? 'Realtime sign-in was rejected. Please sign in again.'
-        : 'Realtime connection unavailable. Check the Socket.IO server URL and try again.';
+        : 'Socket server is not accessible. Please check your internet connection and try again.';
       if (state.lastRefreshError !== message) showNotice(message);
       state.lastRefreshError = message;
     }
@@ -1707,7 +1738,6 @@ async function handleSendMessage(form) {
     const attachmentInput = form.querySelector('#attachment-input');
     if (attachmentInput) attachmentInput.value = '';
     clearAttachmentPreview();
-    updateAttachmentStatus();
     if (file && CACHED_IMAGE_TYPES.has(sentMessage.attachment?.mime)) {
       try {
         const key = attachmentCacheKey(conversation.id, sentMessage.id);
@@ -1769,15 +1799,6 @@ async function handleDeleteMessage(messageId, scope) {
   );
 }
 
-function updateAttachmentStatus() {
-  const status = document.querySelector('#attachment-status');
-  if (status) {
-    status.textContent = state.selectedAttachment
-      ? 'Ready to send · 5 MiB max.'
-      : 'Press Enter to send · Shift + Enter for a new line · Paste an image to attach · 5 MiB max.';
-  }
-}
-
 function selectAttachment(file) {
   if (!file) return;
   if (!isAllowedAttachment(file)) {
@@ -1792,7 +1813,6 @@ function selectAttachment(file) {
   const attachmentInput = document.querySelector('#attachment-input');
   if (attachmentInput) attachmentInput.value = '';
   renderAttachmentPreview(file);
-  updateAttachmentStatus();
 }
 
 function pastedImageFile(clipboardData) {
@@ -1824,10 +1844,6 @@ function pastedImageFile(clipboardData) {
 }
 
 function clearAttachmentPreview() {
-  if (state.attachmentPreviewUrl) {
-    URL.revokeObjectURL(state.attachmentPreviewUrl);
-    state.attachmentPreviewUrl = null;
-  }
   const preview = document.querySelector('#attachment-preview');
   if (preview) {
     preview.replaceChildren();
@@ -1844,23 +1860,11 @@ function renderAttachmentPreview(file) {
   const details = document.createElement('div');
   details.className = 'attachment-preview-details';
   const extension = file.name.split('.').pop()?.toUpperCase() || 'FILE';
-  const imageTypes = new Set([
-    'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp', 'image/avif',
-  ]);
-  if (imageTypes.has(file.type)) {
-    state.attachmentPreviewUrl = URL.createObjectURL(file);
-    const image = document.createElement('img');
-    image.className = 'attachment-preview-image';
-    image.src = state.attachmentPreviewUrl;
-    image.alt = `Preview of ${file.name}`;
-    details.append(image);
-  } else {
-    const icon = document.createElement('span');
-    icon.className = 'attachment-preview-icon';
-    icon.setAttribute('aria-hidden', 'true');
-    icon.textContent = extension.slice(0, 4);
-    details.append(icon);
-  }
+  const icon = document.createElement('span');
+  icon.className = 'attachment-preview-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  icon.textContent = extension.slice(0, 4);
+  details.append(icon);
 
   const description = document.createElement('span');
   description.className = 'attachment-preview-description';
@@ -2027,6 +2031,9 @@ app.addEventListener('submit', async (event) => {
 });
 
 app.addEventListener('click', async (event) => {
+  if (!event.target.closest('.message-menu')) {
+    document.querySelectorAll('.message-menu[open]').forEach((menu) => menu.removeAttribute('open'));
+  }
   if (event.target.matches('.modal-backdrop')) {
     closeModal();
     return;
@@ -2050,7 +2057,10 @@ app.addEventListener('click', async (event) => {
   if (!button) return;
   const { action, id } = button.dataset;
   try {
-    if (action === 'toggle-password-visibility') {
+    if (action === 'open-external-link') {
+      event.preventDefault();
+      await window.desktopApp.openExternal(button.dataset.url);
+    } else if (action === 'toggle-password-visibility') {
       const password = document.querySelector('#password');
       const visible = password.type === 'password';
       password.type = visible ? 'text' : 'password';
@@ -2114,12 +2124,12 @@ app.addEventListener('click', async (event) => {
       const attachmentInput = document.querySelector('#attachment-input');
       if (attachmentInput) attachmentInput.value = '';
       clearAttachmentPreview();
-      updateAttachmentStatus();
     } else if (action === 'toggle-emoji-picker') {
       toggleEmojiPicker();
     } else if (button.dataset.emoji) {
       insertEmoji(button.dataset.emoji);
     } else if (action === 'reply-message') {
+      button.closest('.message-menu')?.removeAttribute('open');
       const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
       if (!message) throw new Error('This message is no longer available.');
       beginReply(message);
@@ -2127,8 +2137,10 @@ app.addEventListener('click', async (event) => {
       state.replyTarget = null;
       updateReplyPreview();
     } else if (action === 'delete-message-for-me') {
+      button.closest('.message-menu')?.removeAttribute('open');
       await handleDeleteMessage(button.dataset.messageId, 'me');
     } else if (action === 'delete-message-for-everyone') {
+      button.closest('.message-menu')?.removeAttribute('open');
       await handleDeleteMessage(button.dataset.messageId, 'everyone');
     } else if (action === 'download-attachment') {
       const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));

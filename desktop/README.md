@@ -40,7 +40,10 @@ are saved locally for this desktop user. The default socket URL is
 - Image attachments are cached per signed-in user in Electron's local
   application data folder on both sender and recipient devices. Cached images
   appear inline in chat, open in a full-size preview when clicked, and remain
-  available after restarting the desktop app.
+  available after restarting the desktop app. Before sending, attachments show
+  their file name without an image thumbnail.
+- HTTP, HTTPS, and common bare-domain links in messages open in the system
+  browser.
 - Paste a copied screenshot or image into the chat message box to attach it;
   it appears in the attachment preview and sends with the message.
 - One-to-one voice and video calls with incoming-call, mute, camera, and

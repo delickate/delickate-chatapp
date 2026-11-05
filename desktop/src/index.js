@@ -181,6 +181,27 @@ ipcMain.handle('desktop:download-update', async (event, version) => {
   return shell.openExternal(candidateUrl);
 });
 
+ipcMain.handle('desktop:open-external', async (event, value) => {
+  if (!isMainWindowEvent(event)) {
+    throw new Error('Links can only be opened by the app window.');
+  }
+  if (typeof value !== 'string' || value.length > 2048) {
+    throw new Error('The link is invalid.');
+  }
+
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('The link is invalid.');
+  }
+  if (!['http:', 'https:'].includes(url.protocol)) {
+    throw new Error('Only HTTP and HTTPS links can be opened.');
+  }
+
+  return shell.openExternal(url.href);
+});
+
 function sendSocketEvent(event, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('chat:socket-event', { event, payload });
