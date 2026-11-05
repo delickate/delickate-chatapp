@@ -43,9 +43,11 @@ const state = {
   groupName: '',
   selectedGroupFriendIds: new Set(),
   conversations: [],
+  groupMembershipRevisions: new Map(),
   unreadCount: null,
   selectedConversationId: null,
   messages: [],
+  replyTarget: null,
   selectedAttachment: null,
   attachmentPreviewUrl: null,
   previewImageUrl: null,
@@ -340,6 +342,7 @@ function clearSession() {
   state.unreadCount = null;
   window.desktopApp?.setUnreadCount(0, false);
   state.messages = [];
+  state.replyTarget = null;
   state.selectedAttachment = null;
   clearAttachmentPreview();
   state.cachedAttachments.clear();
@@ -688,6 +691,7 @@ function renderThread() {
     <div class="message-list" id="message-list"></div>
     <div class="composer-wrap">
       <div class="attachment-preview" id="attachment-preview" aria-live="polite" hidden></div>
+      <div class="reply-preview" id="reply-preview" hidden></div>
       <form class="composer" id="message-form">
         <textarea class="compose-input" name="body" rows="1" maxlength="10000" placeholder="Write a message…" aria-label="Write a message"></textarea>
         <div class="emoji-picker" id="emoji-picker" role="group" aria-label="Choose an emoji" hidden>
@@ -703,6 +707,7 @@ function renderThread() {
       <p class="composer-hint" id="attachment-status" aria-live="polite">Press Enter to send · Shift + Enter for a new line · Paste an image to attach · 5 MiB max.</p>
     </div>`;
   renderMessages();
+  updateReplyPreview();
 }
 
 function renderProfileModal() {
@@ -726,7 +731,10 @@ function renderGroupMembersModal(conversation) {
   const modalRoot = document.querySelector('#modal-root');
   if (!modalRoot || conversation?.type !== 'group') return;
   const members = (conversation.participants || []).filter((member) => member && member.id);
-  const isCreator = String(conversation.created_by) === String(state.user.id);
+  const memberIds = new Set(members.map((member) => String(member.id)));
+  const availableFriends = state.friends.filter((friend) => !memberIds.has(String(friend.id)));
+  const creatorId = conversation.created_by ?? conversation.created_by_user_id;
+  const isCreator = String(creatorId) === String(state.user.id);
   modalRoot.innerHTML = `
     <div class="modal-backdrop" data-modal-backdrop>
       <section class="app-modal group-modal" role="dialog" aria-modal="true" aria-labelledby="group-modal-title">
@@ -746,9 +754,34 @@ function renderGroupMembersModal(conversation) {
             </div>
           `).join('')}
         </div>
+        ${isCreator ? `
+          <form class="add-group-member-form" id="add-group-member-form" data-conversation-id="${escapeHtml(conversation.id)}">
+            <label for="group-member-friend">Add a friend</label>
+            <div class="add-group-member-controls">
+              <select id="group-member-friend" name="user_id" required ${availableFriends.length ? '' : 'disabled'}>
+                ${availableFriends.length
+                  ? `<option value="">Select a friend</option>${availableFriends.map((friend) => `<option value="${escapeHtml(friend.id)}">${escapeHtml(friend.name)}</option>`).join('')}`
+                  : '<option value="">No more friends to add</option>'}
+              </select>
+              <button class="small-button" type="submit" ${availableFriends.length ? '' : 'disabled'}>Add</button>
+            </div>
+          </form>
+        ` : ''}
         ${!isCreator ? `<button class="group-leave-modal" type="button" data-action="leave-group" data-id="${escapeHtml(conversation.id)}">Leave group</button>` : ''}
       </section>
     </div>`;
+}
+
+function updateGroupParticipants(conversationId, participants) {
+  const key = String(conversationId);
+  state.groupMembershipRevisions.set(key, (state.groupMembershipRevisions.get(key) || 0) + 1);
+  state.conversations = state.conversations.map((conversation) =>
+    String(conversation.id) === key ? { ...conversation, participants } : conversation);
+  const updatedConversation = state.conversations.find((conversation) => String(conversation.id) === key);
+  if (updatedConversation && String(state.selectedConversationId) === key) {
+    renderThread();
+    renderGroupMembersModal(updatedConversation);
+  }
 }
 
 function closeModal() {
@@ -829,29 +862,61 @@ function renderMessages() {
   let lastDay = '';
   list.innerHTML = orderedMessages.map((message) => {
     const isMine = String(message.sender?.id) === String(state.user.id);
+    const isDeleted = Boolean(message.deleted_for_everyone_at);
     const day = formattedDay(message.created_at);
     let divider = '';
     if (day !== lastDay) {
       divider = `<div class="day-divider"><span>${escapeHtml(day)}</span></div>`;
       lastDay = day;
     }
-    const receipt = isMine ? (message.read_at ? '✓✓ Seen' : message.delivered_at ? '✓✓ Delivered' : '✓ Sent') : '';
+    const receipt = !isDeleted && isMine
+      ? (message.read_at ? '✓✓ Seen' : message.delivered_at ? '✓✓ Delivered' : '✓ Sent')
+      : '';
     const cacheKey = attachmentCacheKey(message.conversation_id, message.id);
     const imagePreview = message.attachment && CACHED_IMAGE_TYPES.has(message.attachment.mime)
       ? state.cachedAttachments.get(cacheKey)
       : null;
+    const replyPreview = message.reply_to
+      ? `<div class="message-quote"><strong>${escapeHtml(message.reply_to.sender?.name || 'Message')}</strong><span>${escapeHtml(message.reply_to.unavailable ? 'Original message unavailable' : message.reply_to.deleted_for_everyone_at ? 'This message was deleted' : message.reply_to.body || message.reply_to.attachment?.name || 'Attachment')}</span></div>`
+      : '';
     return `${divider}
       <div class="message-row ${isMine ? 'mine' : ''}">
         ${isMine ? '' : messageAvatar(message)}
         <div class="message-bubble">
-          ${message.body ? `<div class="message-text">${escapeHtml(message.body)}</div>` : ''}
-          ${imagePreview ? `<button class="message-image-button" type="button" data-action="preview-image" data-image-url="${escapeHtml(imagePreview)}" data-image-name="${escapeHtml(message.attachment.name)}" aria-label="View ${escapeHtml(message.attachment.name)} full size"><img class="message-image" src="${escapeHtml(imagePreview)}" alt="${escapeHtml(message.attachment.name)}" loading="lazy" decoding="async"></button>` : ''}
-          ${message.attachment ? `<button class="attachment-download" type="button" data-action="download-attachment" data-message-id="${escapeHtml(message.id)}">${escapeHtml(message.attachment.name)} · ${formatFileSize(message.attachment.size)} · Download</button>` : ''}
+          ${replyPreview}
+          ${isDeleted ? '<div class="message-deleted">This message was deleted</div>' : ''}
+          ${!isDeleted && message.body ? `<div class="message-text">${escapeHtml(message.body)}</div>` : ''}
+          ${!isDeleted && imagePreview ? `<button class="message-image-button" type="button" data-action="preview-image" data-image-url="${escapeHtml(imagePreview)}" data-image-name="${escapeHtml(message.attachment.name)}" aria-label="View ${escapeHtml(message.attachment.name)} full size"><img class="message-image" src="${escapeHtml(imagePreview)}" alt="${escapeHtml(message.attachment.name)}" loading="lazy" decoding="async"></button>` : ''}
+          ${!isDeleted && message.attachment ? `<button class="attachment-download" type="button" data-action="download-attachment" data-message-id="${escapeHtml(message.id)}">${escapeHtml(message.attachment.name)} · ${formatFileSize(message.attachment.size)} · Download</button>` : ''}
+          ${!isDeleted ? `<div class="message-actions">
+            <button type="button" data-action="reply-message" data-message-id="${escapeHtml(message.id)}" aria-label="Reply to message" title="Reply">↩</button>
+            <button type="button" data-action="delete-message-for-me" data-message-id="${escapeHtml(message.id)}" aria-label="Delete message for me" title="Delete for me">⌫</button>
+            ${isMine ? `<button type="button" data-action="delete-message-for-everyone" data-message-id="${escapeHtml(message.id)}" aria-label="Delete message for everyone" title="Delete for everyone">×</button>` : ''}
+          </div>` : ''}
           <div class="message-foot"><span>${formattedTime(message.created_at)}</span>${receipt ? `<span>${receipt}</span>` : ''}</div>
         </div>
       </div>`;
   }).join('');
   if (wasNearBottom) list.scrollTop = list.scrollHeight;
+}
+
+function updateReplyPreview() {
+  const preview = document.querySelector('#reply-preview');
+  if (!preview) return;
+  const message = state.replyTarget;
+  preview.hidden = !message;
+  preview.innerHTML = message ? `
+    <div class="reply-preview-content">
+      <strong>Replying to ${escapeHtml(message.sender?.name || 'message')}</strong>
+      <span>${escapeHtml(message.deleted_for_everyone_at ? 'This message was deleted' : message.body || message.attachment?.name || 'Attachment')}</span>
+    </div>
+    <button class="reply-preview-cancel" type="button" data-action="cancel-reply" aria-label="Cancel reply">×</button>` : '';
+}
+
+function beginReply(message) {
+  state.replyTarget = message;
+  updateReplyPreview();
+  document.querySelector('#message-form textarea')?.focus();
 }
 
 function showImagePreview(url, name) {
@@ -933,6 +998,7 @@ async function refreshData() {
   if (!state.token || state.refreshing) return;
   state.refreshing = true;
   try {
+    const membershipRevisionsAtStart = new Map(state.groupMembershipRevisions);
     const [friends, requests, conversations] = await Promise.all([
       api('/friends'),
       api('/friends/requests?direction=incoming'),
@@ -940,9 +1006,18 @@ async function refreshData() {
     ]);
     state.friends = Array.isArray(friends.data) ? friends.data : [];
     state.requests = Array.isArray(requests.data) ? requests.data : [];
+    const previousConversations = state.conversations;
     state.conversations = sortConversationsByLatest(
       Array.isArray(conversations.data) ? conversations.data : [],
-    );
+    ).map((conversation) => {
+      if (conversation.type !== 'group') return conversation;
+      const key = String(conversation.id);
+      if ((state.groupMembershipRevisions.get(key) || 0) <= (membershipRevisionsAtStart.get(key) || 0)) {
+        return conversation;
+      }
+      const current = previousConversations.find((item) => String(item.id) === key);
+      return current ? { ...conversation, participants: current.participants } : conversation;
+    });
     syncUnreadIndicators();
     const friendSignature = state.friends.map((friend) => friend.id).sort().join(',');
     if (state.socketFriendSignature !== null && state.socketFriendSignature !== friendSignature) {
@@ -1433,6 +1508,7 @@ async function openFriend(friendId) {
   state.sidebarTool = null;
   state.selectedConversationId = conversation.id;
   state.messages = [];
+  state.replyTarget = null;
   state.selectedAttachment = null;
   clearAttachmentPreview();
   render();
@@ -1455,6 +1531,7 @@ async function openGroupConversation(conversationId) {
   state.sidebarTool = null;
   state.selectedConversationId = conversation.id;
   state.messages = [];
+  state.replyTarget = null;
   state.selectedAttachment = null;
   clearAttachmentPreview();
   render();
@@ -1552,7 +1629,7 @@ async function handleLeaveGroup(conversationId) {
   showNotice('You left the group.', 'success');
 }
 
-async function handleRemoveGroupMember(conversationId, userId) {
+async function handleRemoveGroupMember(conversationId, userId, button) {
   const conversation = state.conversations.find((item) => String(item.id) === String(conversationId) && item.type === 'group');
   if (!conversation) throw new Error('This group is no longer available.');
   const member = (conversation.participants || []).find((person) => String(person.id) === String(userId));
@@ -1560,18 +1637,37 @@ async function handleRemoveGroupMember(conversationId, userId) {
   const confirmed = window.confirm(`Remove ${member.name} from "${conversation.name}"?`);
   if (!confirmed) return;
 
+  if (button) button.disabled = true;
   await api(`/groups/${encodeURIComponent(conversationId)}/members/${encodeURIComponent(userId)}`, { method: 'DELETE' });
-  await refreshData();
-  if (String(state.selectedConversationId) === String(conversationId)) {
-    const updatedConversation = state.conversations.find((item) => String(item.id) === String(conversationId));
-    if (updatedConversation) {
-      renderThread();
-      renderGroupMembersModal(updatedConversation);
-    } else {
-      closeModal();
-    }
-  }
+  updateGroupParticipants(conversationId, (conversation.participants || []).filter(
+    (person) => String(person.id) !== String(userId),
+  ));
   showNotice(`${member.name} was removed from the group.`, 'success');
+}
+
+async function handleAddGroupMember(form) {
+  const conversationId = form.dataset.conversationId;
+  const userId = new FormData(form).get('user_id')?.toString();
+  if (!conversationId || !userId) throw new Error('Select a friend to add.');
+  const conversation = state.conversations.find((item) =>
+    String(item.id) === String(conversationId) && item.type === 'group');
+  if (!conversation) throw new Error('This group is no longer available.');
+  const friend = state.friends.find((item) => String(item.id) === userId);
+  if (!friend) throw new Error('This friend is no longer available.');
+  const submitButton = form.querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  try {
+    const response = await api(`/groups/${encodeURIComponent(conversationId)}/members`, {
+      method: 'POST',
+      body: { user_id: Number(userId) },
+    });
+    const member = response?.member || friend;
+    const participants = [...(conversation.participants || []), member];
+    updateGroupParticipants(conversationId, participants);
+    showNotice(`${member.name} was added to the group.`, 'success');
+  } finally {
+    if (submitButton.isConnected) submitButton.disabled = false;
+  }
 }
 
 async function handleSendMessage(form) {
@@ -1579,6 +1675,7 @@ async function handleSendMessage(form) {
   const body = field.value.trim();
   const conversation = selectedConversation();
   const file = state.selectedAttachment;
+  const replyTarget = state.replyTarget;
   if (!conversation || (!body && !file)) return;
   if (file && !isAllowedAttachment(file)) {
     throw new Error('Choose an image, document, spreadsheet, or ZIP file.');
@@ -1595,11 +1692,17 @@ async function handleSendMessage(form) {
       if (body) payload.append('body', body);
       payload.append('attachment', file);
     }
+    if (replyTarget) {
+      if (payload instanceof FormData) payload.append('reply_to_message_id', replyTarget.id);
+      else payload.reply_to_message_id = replyTarget.id;
+    }
     const sentMessage = await api(`/conversations/${encodeURIComponent(conversation.id)}/messages`, {
       method: 'POST',
       body: payload,
     });
     field.value = '';
+    state.replyTarget = null;
+    updateReplyPreview();
     state.selectedAttachment = null;
     const attachmentInput = form.querySelector('#attachment-input');
     if (attachmentInput) attachmentInput.value = '';
@@ -1625,6 +1728,45 @@ async function handleSendMessage(form) {
     submitButton.disabled = false;
     field.focus();
   }
+}
+
+async function handleDeleteMessage(messageId, scope) {
+  const conversation = selectedConversation();
+  const message = state.messages.find((item) => String(item.id) === String(messageId));
+  if (!conversation || !message) throw new Error('This message is no longer available.');
+  const forEveryone = scope === 'everyone';
+  const confirmation = forEveryone
+    ? 'Delete this message for everyone? It will be removed for all participants.'
+    : 'Delete this message only for you? Other participants will still see it.';
+  if (!window.confirm(confirmation)) return;
+
+  let cleanupWarning = '';
+  await api(`/conversations/${encodeURIComponent(conversation.id)}/messages/${encodeURIComponent(message.id)}`, {
+    method: 'DELETE',
+    body: { scope: forEveryone ? 'everyone' : 'me' },
+  });
+  if (message.attachment && CACHED_IMAGE_TYPES.has(message.attachment.mime)) {
+    const cacheDetails = {
+      userId: state.user.id,
+      conversationId: conversation.id,
+      messageId: message.id,
+      mime: message.attachment.mime,
+    };
+    state.cachedAttachments.delete(attachmentCacheKey(conversation.id, message.id));
+    try {
+      await window.localAttachments.deleteImage(cacheDetails);
+    } catch (error) {
+      cleanupWarning = ` The local image copy could not be removed: ${error.message}`;
+    }
+  }
+  await loadMessages();
+  renderMessages();
+  await refreshData();
+  if (state.lastRefreshError) return;
+  showNotice(
+    `${forEveryone ? 'Message deleted for everyone.' : 'Message deleted for you.'}${cleanupWarning}`,
+    cleanupWarning ? 'error' : 'success',
+  );
 }
 
 function updateAttachmentStatus() {
@@ -1877,6 +2019,7 @@ app.addEventListener('submit', async (event) => {
     }
     if (form.id === 'add-friend-form') await handleAddFriend(form);
     if (form.id === 'create-group-form') await handleCreateGroup(form);
+    if (form.id === 'add-group-member-form') await handleAddGroupMember(form);
     if (form.id === 'message-form') await handleSendMessage(form);
   } catch (error) {
     showNotice(error.message || 'Something went wrong. Please try again.');
@@ -1958,6 +2101,7 @@ app.addEventListener('click', async (event) => {
       state.joinedRoomId = null;
       state.selectedConversationId = null;
       state.messages = [];
+      state.replyTarget = null;
       state.selectedAttachment = null;
       const attachmentInput = document.querySelector('#attachment-input');
       if (attachmentInput) attachmentInput.value = '';
@@ -1975,6 +2119,17 @@ app.addEventListener('click', async (event) => {
       toggleEmojiPicker();
     } else if (button.dataset.emoji) {
       insertEmoji(button.dataset.emoji);
+    } else if (action === 'reply-message') {
+      const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
+      if (!message) throw new Error('This message is no longer available.');
+      beginReply(message);
+    } else if (action === 'cancel-reply') {
+      state.replyTarget = null;
+      updateReplyPreview();
+    } else if (action === 'delete-message-for-me') {
+      await handleDeleteMessage(button.dataset.messageId, 'me');
+    } else if (action === 'delete-message-for-everyone') {
+      await handleDeleteMessage(button.dataset.messageId, 'everyone');
     } else if (action === 'download-attachment') {
       const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
       await downloadAttachment(message);
@@ -1985,7 +2140,7 @@ app.addEventListener('click', async (event) => {
     } else if (action === 'leave-group') {
       await handleLeaveGroup(id);
     } else if (action === 'remove-group-member') {
-      await handleRemoveGroupMember(button.dataset.conversationId, button.dataset.userId);
+      await handleRemoveGroupMember(button.dataset.conversationId, button.dataset.userId, button);
     } else if (action === 'open-friend') {
       await openFriend(id);
     } else if (action === 'open-conversation') {

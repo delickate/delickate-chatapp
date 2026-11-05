@@ -28,10 +28,12 @@ are saved locally for this desktop user. The default socket URL is
 - A friends-first sidebar with expandable search, add-friend, request, refresh,
   and update actions.
 - One-to-one and group chats with paginated message history, send, unread
-  counts, and seen/delivered receipt display.
+  counts, seen/delivered receipt display, message replies, and WhatsApp-style
+  message deletion for yourself or (for your own messages) everyone.
 - Create titled groups with accepted friends. Group membership is enforced by
   the API and unread counts are tracked separately for each member. Only the
-  creator can remove other members; other participants can leave the group.
+  creator can add accepted friends or remove other members; other participants
+  can leave the group.
 - Attach and download JPEG, PNG, GIF, WebP, PDF, and plain-text files (5 MiB
   maximum). The desktop checks the size before sending; Laravel performs the
   authoritative size, type, and content validation.

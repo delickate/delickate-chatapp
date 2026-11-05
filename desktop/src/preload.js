@@ -59,6 +59,7 @@ contextBridge.exposeInMainWorld('chatSocket', {
 contextBridge.exposeInMainWorld('localAttachments', {
   saveImage: (attachment) => ipcRenderer.invoke('chat:attachment-save', attachment),
   readImage: (attachment) => ipcRenderer.invoke('chat:attachment-read', attachment),
+  deleteImage: (attachment) => ipcRenderer.invoke('chat:attachment-delete', attachment),
 });
 
 contextBridge.exposeInMainWorld('desktopApp', {

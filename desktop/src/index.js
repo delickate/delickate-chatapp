@@ -353,6 +353,14 @@ ipcMain.handle('chat:attachment-read', async (_event, { userId, conversationId, 
   return `data:${mime};base64,${validated.toString('base64')}`;
 });
 
+ipcMain.handle('chat:attachment-delete', async (event, { userId, conversationId, messageId, mime } = {}) => {
+  if (!isMainWindowEvent(event)) {
+    throw new Error('Attachment deletion is only available to the app window.');
+  }
+  const { path: filePath } = attachmentCachePath(userId, conversationId, messageId, mime);
+  await fs.rm(filePath, { force: true });
+});
+
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (require('electron-squirrel-startup')) {
   app.quit();
