@@ -267,6 +267,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .chat-heading p { margin: 5px 0 0; color: #96a19d; font-size: 12px; }
 .chat-actions { display: flex; gap: 9px; }
 .icon-button { display: grid; flex: 0 0 auto; place-items: center; width: 44px; height: 44px; border: 1px solid #e9efec; border-radius: 12px; color: #71817b; background: white; font-size: 21px; }
+.chat-actions .icon-button svg { width: 23px; height: 23px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .icon-button[hidden] { display: none; }
 .message-list { display: flex; flex: 1 1 0; flex-direction: column; min-height: 0; gap: 13px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; padding: 23px clamp(18px, 4vw, 56px); background: var(--chat-bg); }
 .day-divider { display: flex; justify-content: center; margin: 2px 0 6px; }
@@ -297,8 +298,8 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .message-menu-items button:hover, .message-menu-items button:focus-visible { color: var(--green-dark); background: #eef5fc; outline: none; }
 .message-menu-items button[data-action^="delete-message-for-everyone"] { color: #a64e49; }
 .message-menu-items button[data-action^="delete-message-for-everyone"]:hover, .message-menu-items button[data-action^="delete-message-for-everyone"]:focus-visible { background: #fff1ef; }
-.message-image-button { display: block; max-width: min(320px, 100%); margin: 2px 0 8px; padding: 0; border: 0; border-radius: 9px; background: transparent; cursor: zoom-in; }
-.message-image { display: block; max-width: 100%; max-height: 320px; border-radius: 9px; object-fit: contain; }
+.message-image-button { display: block; max-width: min(200px, 100%); margin: 2px 0 8px; padding: 0; border: 0; border-radius: 9px; background: transparent; cursor: zoom-in; }
+.message-image { display: block; max-width: 100%; max-height: 200px; border-radius: 9px; object-fit: contain; }
 .image-viewer { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 54px 24px 24px; background: rgba(8, 15, 13, .92); cursor: zoom-out; }
 .image-viewer-close { position: absolute; top: 16px; right: 20px; display: grid; place-items: center; width: 42px; height: 42px; border: 1px solid rgba(255,255,255,.3); border-radius: 50%; color: #fff; background: rgba(255,255,255,.12); font-size: 30px; cursor: pointer; }
 .image-viewer-full { display: block; max-width: 100%; max-height: 100%; object-fit: contain; cursor: default; }

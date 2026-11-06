@@ -737,8 +737,8 @@ function renderThread() {
       <div class="chat-actions">
         ${conversation.type === 'group' ? `<button class="icon-button group-members-button" type="button" data-action="open-group-members" data-id="${escapeHtml(conversation.id)}" title="View group members" aria-label="View ${groupMembers.length} group members"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 19v-1a6 6 0 0 1 12 0v1"/><path d="M16 5.5a3 3 0 0 1 0 5.8M18 14a5 5 0 0 1 3 4.5v.5"/></svg><span class="group-member-count">${groupMembers.length}</span></button>` : ''}
         <button class="icon-button" type="button" data-action="unfriend" data-id="${escapeHtml(conversation.friend?.id)}" title="Remove friend" aria-label="Remove ${escapeHtml(conversation.friend?.name || 'friend')}" ${conversation.type === 'group' ? 'hidden' : ''}>✕</button>
-        <button class="icon-button" type="button" data-action="call-audio" title="Start voice call" aria-label="Start voice call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}>☎</button>
-        <button class="icon-button" type="button" data-action="call-video" title="Start video call" aria-label="Start video call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}>▣</button>
+        <button class="icon-button" type="button" data-action="call-audio" title="Start voice call" aria-label="Start voice call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.2 3.8 9.5 3.3a1.6 1.6 0 0 1 1.8 1.1l.8 2.8a1.6 1.6 0 0 1-.7 1.8l-1.6 1.1a14 14 0 0 0 4.1 4.1l1.1-1.6a1.6 1.6 0 0 1 1.8-.7l2.8.8a1.6 1.6 0 0 1 1.1 1.8l-.5 2.3a2 2 0 0 1-2 1.6A15.5 15.5 0 0 1 5.6 5.8a2 2 0 0 1 1.6-2Z"/></svg></button>
+        <button class="icon-button" type="button" data-action="call-video" title="Start video call" aria-label="Start video call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="12" height="12" rx="2"/><path d="m15 10 6-3v10l-6-3z"/></svg></button>
         <button class="icon-button" type="button" data-action="refresh" title="Refresh messages" aria-label="Refresh messages">↻</button>
       </div>
     </header>
@@ -930,6 +930,16 @@ function renderMessages() {
     const imagePreview = message.attachment && CACHED_IMAGE_TYPES.has(message.attachment.mime)
       ? state.cachedAttachments.get(cacheKey)
       : null;
+    const bodyMarkup = !isDeleted && message.body
+      ? `<div class="message-text">${linkifyMessageText(message.body)}</div>`
+      : '';
+    const imageMarkup = !isDeleted && imagePreview
+      ? `<button class="message-image-button" type="button" data-action="preview-image" data-image-url="${escapeHtml(imagePreview)}" data-image-name="${escapeHtml(message.attachment.name)}" aria-label="View ${escapeHtml(message.attachment.name)} full size"><img class="message-image" src="${escapeHtml(imagePreview)}" alt="${escapeHtml(message.attachment.name)}" loading="lazy" decoding="async"></button>`
+      : '';
+    const attachmentMarkup = !isDeleted && message.attachment
+      ? `<button class="attachment-download" type="button" data-action="download-attachment" data-message-id="${escapeHtml(message.id)}">${escapeHtml(message.attachment.name)} · ${formatFileSize(message.attachment.size)} · Download</button>`
+      : '';
+    const imageWithCaption = message.attachment && CACHED_IMAGE_TYPES.has(message.attachment.mime);
     const replyPreview = message.reply_to
       ? `<div class="message-quote"><strong>${escapeHtml(message.reply_to.sender?.name || 'Message')}</strong><span>${escapeHtml(message.reply_to.unavailable ? 'Original message unavailable' : message.reply_to.deleted_for_everyone_at ? 'This message was deleted' : message.reply_to.body || message.reply_to.attachment?.name || 'Attachment')}</span></div>`
       : '';
@@ -939,13 +949,12 @@ function renderMessages() {
         <div class="message-bubble">
           ${replyPreview}
           ${isDeleted ? '<div class="message-deleted">This message was deleted</div>' : ''}
-          ${!isDeleted && message.body ? `<div class="message-text">${linkifyMessageText(message.body)}</div>` : ''}
-          ${!isDeleted && imagePreview ? `<button class="message-image-button" type="button" data-action="preview-image" data-image-url="${escapeHtml(imagePreview)}" data-image-name="${escapeHtml(message.attachment.name)}" aria-label="View ${escapeHtml(message.attachment.name)} full size"><img class="message-image" src="${escapeHtml(imagePreview)}" alt="${escapeHtml(message.attachment.name)}" loading="lazy" decoding="async"></button>` : ''}
-          ${!isDeleted && message.attachment ? `<button class="attachment-download" type="button" data-action="download-attachment" data-message-id="${escapeHtml(message.id)}">${escapeHtml(message.attachment.name)} · ${formatFileSize(message.attachment.size)} · Download</button>` : ''}
+          ${imageWithCaption ? `${imageMarkup}${bodyMarkup}${attachmentMarkup}` : `${bodyMarkup}${imageMarkup}${attachmentMarkup}`}
           ${!isDeleted ? `<details class="message-menu ${isMine ? 'mine' : 'other'}">
             <summary aria-label="Message options" title="Message options">⋯</summary>
             <div class="message-menu-items" role="menu" aria-label="Message options">
               <button type="button" role="menuitem" data-action="reply-message" data-message-id="${escapeHtml(message.id)}">↩ <span>Reply</span></button>
+              <button type="button" role="menuitem" data-action="copy-message" data-message-id="${escapeHtml(message.id)}">⧉ <span>Copy message</span></button>
               <button type="button" role="menuitem" data-action="delete-message-for-me" data-message-id="${escapeHtml(message.id)}">⌫ <span>Delete for me</span></button>
               ${isMine ? `<button type="button" role="menuitem" data-action="delete-message-for-everyone" data-message-id="${escapeHtml(message.id)}">× <span>Delete for everyone</span></button>` : ''}
             </div>
@@ -2163,6 +2172,14 @@ app.addEventListener('click', async (event) => {
       const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
       if (!message) throw new Error('This message is no longer available.');
       beginReply(message);
+    } else if (action === 'copy-message') {
+      button.closest('.message-menu')?.removeAttribute('open');
+      const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
+      if (!message) throw new Error('This message is no longer available.');
+      const text = message.body || message.attachment?.name;
+      if (!text) throw new Error('This message has no text to copy.');
+      await window.desktopApp.copyText(text);
+      showNotice('Message copied.', 'success');
     } else if (action === 'cancel-reply') {
       state.replyTarget = null;
       updateReplyPreview();

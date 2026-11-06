@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, session, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, session, shell } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { io } = require('socket.io-client');
@@ -200,6 +200,18 @@ ipcMain.handle('desktop:open-external', async (event, value) => {
   }
 
   return shell.openExternal(url.href);
+});
+
+ipcMain.handle('desktop:copy-text', (event, value) => {
+  if (!isMainWindowEvent(event)) {
+    throw new Error('Clipboard access is only available to the app window.');
+  }
+  if (typeof value !== 'string' || value.length > 10000) {
+    throw new Error('The message text is invalid.');
+  }
+
+  clipboard.writeText(value);
+  return true;
 });
 
 function sendSocketEvent(event, payload) {
