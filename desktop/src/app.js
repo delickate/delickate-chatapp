@@ -924,7 +924,7 @@ function renderMessages() {
       lastDay = day;
     }
     const receipt = !isDeleted && isMine
-      ? (message.read_at ? '✓✓ Seen' : message.delivered_at ? '✓✓ Delivered' : '✓ Sent')
+      ? `<span class="message-receipt${message.read_at ? ' seen' : ''}" aria-label="${message.read_at ? 'Seen' : message.delivered_at ? 'Delivered' : 'Sent'}" title="${message.read_at ? 'Seen' : message.delivered_at ? 'Delivered' : 'Sent'}">${message.read_at || message.delivered_at ? '✓✓' : '✓'}</span>`
       : '';
     const cacheKey = attachmentCacheKey(message.conversation_id, message.id);
     const imagePreview = message.attachment && CACHED_IMAGE_TYPES.has(message.attachment.mime)
@@ -940,6 +940,8 @@ function renderMessages() {
       ? `<button class="attachment-download" type="button" data-action="download-attachment" data-message-id="${escapeHtml(message.id)}">${escapeHtml(message.attachment.name)} · ${formatFileSize(message.attachment.size)} · Download</button>`
       : '';
     const imageWithCaption = message.attachment && CACHED_IMAGE_TYPES.has(message.attachment.mime);
+    const inlineTextFooter = !isDeleted && Boolean(message.body) && !message.attachment;
+    const messageFooter = `<div class="message-foot"><span>${formattedTime(message.created_at)}${receipt ? ` ${receipt}` : ''}</span></div>`;
     const replyPreview = message.reply_to
       ? `<div class="message-quote"><strong>${escapeHtml(message.reply_to.sender?.name || 'Message')}</strong><span>${escapeHtml(message.reply_to.unavailable ? 'Original message unavailable' : message.reply_to.deleted_for_everyone_at ? 'This message was deleted' : message.reply_to.body || message.reply_to.attachment?.name || 'Attachment')}</span></div>`
       : '';
@@ -949,7 +951,9 @@ function renderMessages() {
         <div class="message-bubble">
           ${replyPreview}
           ${isDeleted ? '<div class="message-deleted">This message was deleted</div>' : ''}
-          ${imageWithCaption ? `${imageMarkup}${bodyMarkup}${attachmentMarkup}` : `${bodyMarkup}${imageMarkup}${attachmentMarkup}`}
+          ${inlineTextFooter
+            ? `<div class="message-content">${bodyMarkup}${messageFooter}</div>`
+            : imageWithCaption ? `${imageMarkup}${bodyMarkup}${attachmentMarkup}` : `${bodyMarkup}${imageMarkup}${attachmentMarkup}`}
           ${!isDeleted ? `<details class="message-menu ${isMine ? 'mine' : 'other'}">
             <summary aria-label="Message options" title="Message options">⋯</summary>
             <div class="message-menu-items" role="menu" aria-label="Message options">
@@ -959,7 +963,7 @@ function renderMessages() {
               ${isMine ? `<button type="button" role="menuitem" data-action="delete-message-for-everyone" data-message-id="${escapeHtml(message.id)}">× <span>Delete for everyone</span></button>` : ''}
             </div>
           </details>` : ''}
-          <div class="message-foot"><span>${formattedTime(message.created_at)}${receipt ? ` · ${receipt}` : ''}</span></div>
+          ${inlineTextFooter ? '' : messageFooter}
         </div>
       </div>`;
   }).join('');
