@@ -242,6 +242,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .profile-modal-name { color: var(--ink); font-size: 17px; font-weight: 700; }
 .profile-modal-phone, .modal-subtitle { margin-top: 5px; color: var(--muted); font-size: 12px; }
 .profile-change-button { width: 100%; margin-top: 22px; }
+.profile-picture-guidance { margin: 10px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; text-align: center; }
 .modal-subtitle { margin: 0 0 16px; }
 .modal-member-list { display: grid; max-height: 390px; overflow-y: auto; }
 .modal-member-row { display: flex; align-items: center; gap: 11px; min-height: 58px; border-bottom: 1px solid #edf1ef; }
@@ -345,7 +346,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .message-row.mine .attachment-download { border-color: #c4daf0; }
 .send-button { display: grid; flex: 0 0 auto; place-items: center; width: 40px; height: 40px; border: 0; border-radius: 11px; color: #fff; background: var(--green); font-size: 16px; }
 .send-button:hover { background: var(--green-dark); }
-.notice { position: fixed; z-index: 5; top: 18px; left: 50%; width: min(500px, calc(100% - 36px)); padding: 12px 15px; transform: translateX(-50%); border: 1px solid #f0d6d3; border-radius: 11px; color: #8e4f4b; background: #fff8f7; box-shadow: var(--shadow); font-size: 12px; }
+.notice { position: fixed; z-index: 30; top: 18px; left: 50%; width: min(500px, calc(100% - 36px)); padding: 12px 15px; transform: translateX(-50%); border: 1px solid #f0d6d3; border-radius: 11px; color: #8e4f4b; background: #fff8f7; box-shadow: var(--shadow); font-size: 12px; }
 .notice.success { border-color: #c9dff3; color: var(--green-dark); background: #eff6fc; }
 .notice[hidden] { display: none; }
 .loading-overlay { opacity: .65; pointer-events: none; }

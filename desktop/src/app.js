@@ -266,7 +266,14 @@ async function api(path, options = {}) {
       clearSession();
       render();
     }
-    throw new Error(apiErrorMessage(payload, response.status));
+    const message = apiErrorMessage(payload, response.status);
+    if (
+      path === '/friends/requests' &&
+      (response.status === 404 || /no query results for model|modelnotfoundexception|friend not found|user not found/i.test(message))
+    ) {
+      throw new Error('This person does not exist or cannot be added.');
+    }
+    throw new Error(message);
   }
   return payload;
 }
@@ -568,7 +575,25 @@ function renderSidebar() {
     button.setAttribute('aria-expanded', String(active));
   });
   toolsPanel.hidden = !state.sidebarTool;
+  const focusedInput = document.activeElement instanceof HTMLInputElement &&
+    toolsPanel.contains(document.activeElement) &&
+    document.activeElement.id
+    ? {
+      id: document.activeElement.id,
+      selectionStart: document.activeElement.selectionStart,
+      selectionEnd: document.activeElement.selectionEnd,
+    }
+    : null;
   toolsPanel.innerHTML = renderSidebarTool();
+  if (focusedInput) {
+    const replacementInput = document.getElementById(focusedInput.id);
+    if (replacementInput instanceof HTMLInputElement && toolsPanel.contains(replacementInput)) {
+      replacementInput.focus({ preventScroll: true });
+      if (focusedInput.selectionStart !== null && focusedInput.selectionEnd !== null) {
+        replacementInput.setSelectionRange(focusedInput.selectionStart, focusedInput.selectionEnd);
+      }
+    }
+  }
   renderFriendList();
 }
 
@@ -750,6 +775,7 @@ function renderProfileModal() {
         <div class="profile-modal-name">${escapeHtml(state.user.name)}</div>
         <div class="profile-modal-phone">${escapeHtml(state.user.phone)}</div>
         <button class="primary-button profile-change-button" type="button" data-action="choose-profile-picture">Change profile picture</button>
+        <p class="profile-picture-guidance">Recommended: a square image, at least 256 x 256 px. JPEG, PNG, GIF, or WEBP; maximum 5 MB. Other image dimensions are fitted automatically.</p>
         <input id="profile-picture-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
       </section>
     </div>`;
@@ -1754,6 +1780,10 @@ async function handleSendMessage(form) {
       }
     }
     await refreshData();
+    const messageList = document.querySelector('#message-list');
+    if (messageList && String(state.selectedConversationId) === String(conversation.id)) {
+      messageList.scrollTop = messageList.scrollHeight;
+    }
   } finally {
     submitButton.disabled = false;
     field.focus();
