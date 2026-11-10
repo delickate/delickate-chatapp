@@ -9,6 +9,7 @@ const SOCKET_EVENTS = new Set([
   'presence:sync',
   'presence:update',
   'conversation:joined',
+  'conversation:message',
   'conversation:typing',
   'conversation:stop-typing',
   'server:error',
@@ -39,6 +40,10 @@ contextBridge.exposeInMainWorld('chatSocket', {
   setTyping: (conversationId, isTyping) => ipcRenderer.invoke('chat:socket-typing', {
     conversationId,
     isTyping,
+  }),
+  notifyMessage: (conversationId, messageId) => ipcRenderer.invoke('chat:message-event', {
+    conversationId,
+    messageId,
   }),
   sendCallEvent: (event, payload) => ipcRenderer.invoke('chat:call-event', { event, payload }),
   onEvent: (callback) => {

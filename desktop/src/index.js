@@ -47,6 +47,7 @@ const SOCKET_EVENTS = [
   'presence:sync',
   'presence:update',
   'conversation:joined',
+  'conversation:message',
   'conversation:typing',
   'conversation:stop-typing',
   'server:error',
@@ -295,6 +296,20 @@ ipcMain.handle('chat:socket-typing', (_event, { conversationId, isTyping } = {})
 
   socketClient.emit(isTyping ? 'conversation:typing' : 'conversation:stop-typing', {
     conversation_id: Number(conversationId),
+  });
+  return true;
+});
+
+ipcMain.handle('chat:message-event', (_event, { conversationId, messageId } = {}) => {
+  if (!socketClient?.connected) return false;
+  if (!Number.isSafeInteger(Number(conversationId)) || Number(conversationId) < 1 ||
+    !Number.isSafeInteger(Number(messageId)) || Number(messageId) < 1) {
+    throw new Error('The message notification is invalid.');
+  }
+
+  socketClient.emit('conversation:message', {
+    conversation_id: Number(conversationId),
+    message_id: Number(messageId),
   });
   return true;
 });

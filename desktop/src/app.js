@@ -36,6 +36,7 @@ const state = {
   user: readStoredUser(),
   authMode: 'login',
   friends: [],
+  blockedUsers: [],
   requests: [],
   sidebarTool: null,
   friendSearchQuery: '',
@@ -63,6 +64,7 @@ const state = {
   joinedRoomId: null,
   socketFriendSignature: null,
   refreshing: false,
+  refreshPending: false,
   pollTimer: null,
   noticeTimer: null,
   lastRefreshError: '',
@@ -187,6 +189,26 @@ function formattedTime(value) {
   return Number.isNaN(date.getTime())
     ? ''
     : new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(date);
+}
+
+function formatCallDuration(value) {
+  const totalSeconds = Math.max(0, Math.floor(Number(value) || 0));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+    : `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function messagePreview(message, fallback = '') {
+  if (message?.type === 'call' && message.call) {
+    const mediaName = message.call.media_type === 'video' ? 'video' : 'voice';
+    return message.call.status === 'missed'
+      ? `Missed ${mediaName} call`
+      : `${mediaName === 'video' ? 'Video' : 'Voice'} call · ${formatCallDuration(message.call.duration_seconds)}`;
+  }
+  return message?.body || message?.attachment?.name || fallback;
 }
 
 function formattedDay(value) {
@@ -536,6 +558,7 @@ function showChatShell() {
           <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="add" aria-label="Add a friend" aria-expanded="false" title="Add a friend"><span aria-hidden="true">＋</span><span>Add</span></button>
           <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="group" aria-label="Create a group" aria-expanded="false" title="Create a group"><span aria-hidden="true">◎</span><span>Group</span></button>
           <button class="rail-tool request-tool" type="button" data-action="toggle-sidebar-tool" data-tool="requests" aria-label="Friend requests" aria-expanded="false" title="Friend requests"><span aria-hidden="true">✉</span><span>Requests</span><span class="tool-badge" id="request-count" hidden></span></button>
+          <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="blocked" aria-label="Blocked users" aria-expanded="false" title="Blocked users"><span aria-hidden="true">⊘</span><span>Blocked</span></button>
           <button class="rail-tool" type="button" data-action="refresh" aria-label="Refresh friends and messages" title="Refresh"><span aria-hidden="true">↻</span><span>Sync</span></button>
           <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="updates" aria-label="Check app updates" aria-expanded="false" title="App updates"><span aria-hidden="true">⋯</span><span>Updates</span></button>
         </div>
@@ -647,6 +670,23 @@ function renderSidebarTool() {
         </div>
       </section>`;
   }
+  if (state.sidebarTool === 'blocked') {
+    return `
+      <section class="tool-section" aria-label="Blocked users">
+        <h2>Blocked users${state.blockedUsers.length ? ` (${state.blockedUsers.length})` : ''}</h2>
+        <div class="request-list">${state.blockedUsers.length
+          ? state.blockedUsers.map((user) => `
+            <div class="request-row">
+              ${friendAvatar(user)}
+              <div class="request-info"><div class="person-name">${escapeHtml(user.name)}</div><div class="person-sub">${escapeHtml(user.phone)}</div></div>
+              <div class="request-actions">
+                <button type="button" data-action="unblock-user" data-id="${escapeHtml(user.id)}" title="Unblock ${escapeHtml(user.name)}" aria-label="Unblock ${escapeHtml(user.name)}">↩</button>
+              </div>
+            </div>`).join('')
+          : '<div class="empty-list">You have not blocked anyone.</div>'}
+        </div>
+      </section>`;
+  }
   if (state.sidebarTool === 'updates') return updateControls();
   return '';
 }
@@ -661,8 +701,7 @@ function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.f
       .filter((conversation) => conversation.type === 'group')
       .map((conversation) => ({ kind: 'group', conversation })),
   ].filter(({ friend, conversation }) => {
-    const preview = conversation?.last_message?.body ||
-      conversation?.last_message?.attachment?.name || '';
+    const preview = messagePreview(conversation?.last_message);
     return !filter || `${friend?.name || conversationTitle(conversation)} ${preview}`
       .toLowerCase().includes(filter);
   }).sort((left, right) => {
@@ -678,7 +717,7 @@ function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.f
       if (kind === 'group') return renderGroupListItem(conversation);
       const unreadCount = Number(conversation?.unread_count) || 0;
       const lastMessage = conversation?.last_message;
-      const preview = lastMessage?.body || lastMessage?.attachment?.name || 'Start a conversation';
+      const preview = messagePreview(lastMessage, 'Start a conversation');
       const messagePreview = lastMessage && String(lastMessage.sender?.id) === String(state.user.id)
         ? `You: ${preview}`
         : preview;
@@ -700,7 +739,7 @@ function renderGroupListItem(conversation) {
   const unreadCount = Number(conversation.unread_count) || 0;
   const lastMessage = conversation.last_message;
   const preview = lastMessage
-    ? `${lastMessage.sender?.name ? `${lastMessage.sender.name}: ` : ''}${lastMessage.body || lastMessage.attachment?.name || 'Attachment'}`
+    ? `${lastMessage.sender?.name ? `${lastMessage.sender.name}: ` : ''}${messagePreview(lastMessage, 'Attachment')}`
     : `${conversation.participants?.length || 0} members`;
   const memberNames = participantNames(conversation);
   const tooltip = memberNames ? `Members: ${memberNames}` : 'Group members';
@@ -737,6 +776,7 @@ function renderThread() {
       <div class="chat-actions">
         ${conversation.type === 'group' ? `<button class="icon-button group-members-button" type="button" data-action="open-group-members" data-id="${escapeHtml(conversation.id)}" title="View group members" aria-label="View ${groupMembers.length} group members"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 19v-1a6 6 0 0 1 12 0v1"/><path d="M16 5.5a3 3 0 0 1 0 5.8M18 14a5 5 0 0 1 3 4.5v.5"/></svg><span class="group-member-count">${groupMembers.length}</span></button>` : ''}
         <button class="icon-button" type="button" data-action="unfriend" data-id="${escapeHtml(conversation.friend?.id)}" title="Remove friend" aria-label="Remove ${escapeHtml(conversation.friend?.name || 'friend')}" ${conversation.type === 'group' ? 'hidden' : ''}>✕</button>
+        <button class="icon-button" type="button" data-action="block-user" data-id="${escapeHtml(conversation.friend?.id)}" title="Block user" aria-label="Block ${escapeHtml(conversation.friend?.name || 'user')}" ${conversation.type === 'group' ? 'hidden' : ''}>⊘</button>
         <button class="icon-button" type="button" data-action="call-audio" title="Start voice call" aria-label="Start voice call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.2 3.8 9.5 3.3a1.6 1.6 0 0 1 1.8 1.1l.8 2.8a1.6 1.6 0 0 1-.7 1.8l-1.6 1.1a14 14 0 0 0 4.1 4.1l1.1-1.6a1.6 1.6 0 0 1 1.8-.7l2.8.8a1.6 1.6 0 0 1 1.1 1.8l-.5 2.3a2 2 0 0 1-2 1.6A15.5 15.5 0 0 1 5.6 5.8a2 2 0 0 1 1.6-2Z"/></svg></button>
         <button class="icon-button" type="button" data-action="call-video" title="Start video call" aria-label="Start video call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="12" height="12" rx="2"/><path d="m15 10 6-3v10l-6-3z"/></svg></button>
         <button class="icon-button" type="button" data-action="refresh" title="Refresh messages" aria-label="Refresh messages">↻</button>
@@ -824,6 +864,80 @@ function renderGroupMembersModal(conversation) {
         ${!isCreator ? `<button class="group-leave-modal" type="button" data-action="leave-group" data-id="${escapeHtml(conversation.id)}">Leave group</button>` : ''}
       </section>
     </div>`;
+}
+
+function renderForwardModal(message) {
+  const modalRoot = document.querySelector('#modal-root');
+  if (!modalRoot) return;
+  const targets = state.conversations.filter((conversation) =>
+    String(conversation.id) !== String(message.conversation_id));
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <form class="app-modal forward-modal" id="forward-message-form" role="dialog" aria-modal="true" aria-labelledby="forward-modal-title" data-message-id="${escapeHtml(message.id)}" data-source-conversation-id="${escapeHtml(message.conversation_id)}">
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Close forward dialog">×</button>
+        <h2 id="forward-modal-title">Forward message</h2>
+        <p class="modal-subtitle">${escapeHtml(message.body || message.attachment?.name || 'Attachment')}</p>
+        <div class="forward-target-list">
+          ${targets.length
+            ? targets.map((conversation) => `
+              <label class="forward-target-row">
+                <input type="checkbox" name="target_conversation_ids" value="${escapeHtml(conversation.id)}">
+                ${conversationAvatar(conversation)}
+                <span>${escapeHtml(conversationTitle(conversation))}</span>
+              </label>
+            `).join('')
+            : '<div class="empty-list">No other conversations are available.</div>'}
+        </div>
+        <footer class="forward-modal-actions">
+          <span class="forward-selection-count" id="forward-selection-count" aria-live="polite">0 selected</span>
+          <button class="primary-button" type="submit" ${targets.length ? '' : 'disabled'}>Forward</button>
+        </footer>
+      </form>
+    </div>`;
+}
+
+async function handleForwardMessage(form) {
+  const messageId = form.dataset.messageId;
+  const sourceConversationId = form.dataset.sourceConversationId;
+  const selectedTargets = Array.from(form.querySelectorAll('input[name="target_conversation_ids"]:checked'));
+  if (!selectedTargets.length) throw new Error('Select at least one conversation to forward to.');
+
+  const message = state.messages.find((item) => String(item.id) === String(messageId));
+  if (!message) throw new Error('This message is no longer available.');
+  const submitButton = form.querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  submitButton.textContent = `Forwarding to ${selectedTargets.length}…`;
+
+  const results = await Promise.allSettled(selectedTargets.map(async (checkbox) => {
+    const targetConversationId = checkbox.value;
+    const forwardedMessage = await api(
+      `/conversations/${encodeURIComponent(sourceConversationId)}/messages/${encodeURIComponent(messageId)}/forward`,
+      { method: 'POST', body: { target_conversation_id: Number(targetConversationId) } },
+    );
+    await notifyMessageSent(targetConversationId, forwardedMessage.id);
+    checkbox.checked = false;
+    return targetConversationId;
+  }));
+  const failures = results
+    .map((result, index) => ({ result, checkbox: selectedTargets[index] }))
+    .filter(({ result }) => result.status === 'rejected');
+  const succeeded = results.length - failures.length;
+
+  if (!failures.length) {
+    closeModal();
+    await refreshData();
+    showNotice(`Message forwarded to ${succeeded} ${succeeded === 1 ? 'conversation' : 'conversations'}.`, 'success');
+    return;
+  }
+
+  submitButton.disabled = false;
+  submitButton.textContent = 'Forward';
+  const failedNames = failures.map(({ checkbox }) =>
+    conversationTitle(state.conversations.find((item) => String(item.id) === checkbox.value)) || 'a conversation');
+  const detail = failures[0].result.reason?.message || 'Please try again.';
+  showNotice(
+    `${succeeded ? `Forwarded to ${succeeded}. ` : ''}Could not forward to ${failedNames.join(', ')}. ${detail}`,
+  );
 }
 
 function updateGroupParticipants(conversationId, participants) {
@@ -923,6 +1037,19 @@ function renderMessages() {
       divider = `<div class="day-divider"><span>${escapeHtml(day)}</span></div>`;
       lastDay = day;
     }
+    if (message.type === 'call' && message.call) {
+      const missed = message.call.status === 'missed';
+      const title = messagePreview(message);
+      const icon = missed ? '↙' : (isMine ? '↗' : '↙');
+      return `${divider}
+        <div class="call-log-row${missed ? ' missed' : ''}" role="note">
+          <span class="call-log-icon" aria-hidden="true">${icon}</span>
+          <span class="call-log-details">
+            <strong>${escapeHtml(title)}</strong>
+            <time>${formattedTime(message.created_at)}</time>
+          </span>
+        </div>`;
+    }
     const receipt = !isDeleted && isMine
       ? `<span class="message-receipt${message.read_at ? ' seen' : ''}" aria-label="${message.read_at ? 'Seen' : message.delivered_at ? 'Delivered' : 'Sent'}" title="${message.read_at ? 'Seen' : message.delivered_at ? 'Delivered' : 'Sent'}">${message.read_at || message.delivered_at ? '✓✓' : '✓'}</span>`
       : '';
@@ -945,10 +1072,12 @@ function renderMessages() {
     const replyPreview = message.reply_to
       ? `<div class="message-quote"><strong>${escapeHtml(message.reply_to.sender?.name || 'Message')}</strong><span>${escapeHtml(message.reply_to.unavailable ? 'Original message unavailable' : message.reply_to.deleted_for_everyone_at ? 'This message was deleted' : message.reply_to.body || message.reply_to.attachment?.name || 'Attachment')}</span></div>`
       : '';
+    const forwardedLabel = message.is_forwarded ? '<div class="message-forwarded">↗ Forwarded</div>' : '';
     return `${divider}
       <div class="message-row ${isMine ? 'mine' : ''}">
         ${isMine ? '' : messageAvatar(message)}
         <div class="message-bubble">
+          ${forwardedLabel}
           ${replyPreview}
           ${isDeleted ? '<div class="message-deleted">This message was deleted</div>' : ''}
           ${inlineTextFooter
@@ -958,6 +1087,7 @@ function renderMessages() {
             <summary aria-label="Message options" title="Message options">⋯</summary>
             <div class="message-menu-items" role="menu" aria-label="Message options">
               <button type="button" role="menuitem" data-action="reply-message" data-message-id="${escapeHtml(message.id)}">↩ <span>Reply</span></button>
+              <button type="button" role="menuitem" data-action="forward-message" data-message-id="${escapeHtml(message.id)}">↗ <span>Forward</span></button>
               <button type="button" role="menuitem" data-action="copy-message" data-message-id="${escapeHtml(message.id)}">⧉ <span>Copy message</span></button>
               <button type="button" role="menuitem" data-action="delete-message-for-me" data-message-id="${escapeHtml(message.id)}">⌫ <span>Delete for me</span></button>
               ${isMine ? `<button type="button" role="menuitem" data-action="delete-message-for-everyone" data-message-id="${escapeHtml(message.id)}">× <span>Delete for everyone</span></button>` : ''}
@@ -1064,18 +1194,33 @@ async function loadMessages({ markRead = true } = {}) {
   await cacheMessageImages(conversation.id, state.messages);
 }
 
+async function notifyMessageSent(conversationId, messageId) {
+  if (!window.chatSocket) return;
+  try {
+    await window.chatSocket.notifyMessage(conversationId, messageId);
+  } catch (error) {
+    showNotice(`Message sent, but its real-time update could not be published: ${error.message}`);
+  }
+}
+
 async function refreshData() {
-  if (!state.token || state.refreshing) return;
+  if (!state.token) return;
+  if (state.refreshing) {
+    state.refreshPending = true;
+    return;
+  }
   state.refreshing = true;
   try {
     const membershipRevisionsAtStart = new Map(state.groupMembershipRevisions);
-    const [friends, requests, conversations] = await Promise.all([
+    const [friends, requests, conversations, blockedUsers] = await Promise.all([
       api('/friends'),
       api('/friends/requests?direction=incoming'),
       api('/conversations'),
+      api('/blocks'),
     ]);
     state.friends = Array.isArray(friends.data) ? friends.data : [];
     state.requests = Array.isArray(requests.data) ? requests.data : [];
+    state.blockedUsers = Array.isArray(blockedUsers.data) ? blockedUsers.data : [];
     const previousConversations = state.conversations;
     state.conversations = sortConversationsByLatest(
       Array.isArray(conversations.data) ? conversations.data : [],
@@ -1097,6 +1242,11 @@ async function refreshData() {
 
     if (state.selectedConversationId && !state.conversations.some((item) =>
       String(item.id) === String(state.selectedConversationId))) {
+      if (state.activeRoomId) window.chatSocket?.leaveConversation(state.activeRoomId);
+      state.activeRoomId = null;
+      state.joinedRoomId = null;
+      stopLocalTyping();
+      clearTypingIndicator();
       state.selectedConversationId = null;
       state.messages = [];
       renderThread();
@@ -1113,6 +1263,10 @@ async function refreshData() {
     state.lastRefreshError = error.message;
   } finally {
     state.refreshing = false;
+    if (state.refreshPending) {
+      state.refreshPending = false;
+      void refreshData();
+    }
   }
 }
 
@@ -1180,6 +1334,34 @@ function cleanupCall() {
   renderCallOverlay();
 }
 
+async function persistCallSummary(payload) {
+  const conversationId = Number(payload?.conversation_id);
+  const callerId = Number(payload?.caller_id);
+  if (!Number.isSafeInteger(conversationId) || conversationId < 1 ||
+    !Number.isSafeInteger(callerId) || callerId < 1 ||
+    !['missed', 'completed'].includes(payload?.call_status)) return;
+
+  const message = await api(`/conversations/${encodeURIComponent(conversationId)}/calls`, {
+    method: 'POST',
+    body: {
+      call_id: payload.call_id,
+      caller_id: callerId,
+      status: payload.call_status,
+      media_type: payload.media_type,
+      duration_seconds: payload.duration_seconds,
+    },
+  });
+
+  if (String(state.selectedConversationId) !== String(conversationId)) return;
+  state.messages = [message, ...state.messages.filter((item) => String(item.id) !== String(message.id))];
+  state.conversations = state.conversations.map((conversation) =>
+    String(conversation.id) === String(conversationId)
+      ? { ...conversation, last_message: message, updated_at: message.created_at }
+      : conversation);
+  renderFriendList();
+  renderMessages();
+}
+
 function stopCall(message) {
   if (message) showNotice(message);
   cleanupCall();
@@ -1215,6 +1397,7 @@ async function startCall(mediaType) {
     phase: 'ringing',
     muted: false,
     cameraEnabled: true,
+    connectedNotified: false,
     playbackWarningShown: false,
     connectionStatus: '',
   };
@@ -1273,7 +1456,13 @@ async function createPeerConnection(call, initiator) {
   };
   peer.onconnectionstatechange = () => {
     if (state.call?.id !== call.id) return;
-    if (peer.connectionState === 'connected') updateCall({ phase: 'active' });
+    if (peer.connectionState === 'connected') {
+      if (!state.call.connectedNotified) {
+        state.call.connectedNotified = true;
+        void sendCallEvent('call:connected', { call_id: call.id });
+      }
+      updateCall({ phase: 'active' });
+    }
     if (peer.connectionState === 'failed') {
       void sendCallEvent('call:end', { call_id: call.id });
       stopCall('The call could not connect. Check your network, then configure a TURN relay on the call server if either network blocks peer-to-peer connections.');
@@ -1391,13 +1580,24 @@ async function handleCallSocketEvent(event, payload) {
       phase: 'ringing',
       muted: false,
       cameraEnabled: true,
+      connectedNotified: false,
       playbackWarningShown: false,
       connectionStatus: '',
     };
     renderCallOverlay();
-  } else if (!call || payload?.call_id !== call.id) {
     return;
-  } else if (event === 'call:accepted' && call.direction === 'outgoing') {
+  }
+
+  if (['call:timeout', 'call:rejected', 'call:unavailable', 'call:ended'].includes(event) &&
+    payload?.call_status) {
+    void persistCallSummary(payload).catch((error) =>
+      showNotice(`Call history could not be saved: ${error.message}`));
+  }
+
+  if (!call || payload?.call_id !== call.id) {
+    return;
+  }
+  if (event === 'call:accepted' && call.direction === 'outgoing') {
     try {
       await createPeerConnection(call, true);
     } catch (error) {
@@ -1471,6 +1671,10 @@ function handleSocketEvent(event, payload) {
     } else if (payload?.conversation_id) {
       window.chatSocket?.leaveConversation(payload.conversation_id);
     }
+  } else if (event === 'conversation:message' &&
+    Number.isSafeInteger(Number(payload?.conversation_id)) &&
+    Number.isSafeInteger(Number(payload?.message_id))) {
+    void refreshData();
   } else if (event === 'conversation:typing' && selectedConversation() &&
     String(payload?.conversation_id) === String(state.selectedConversationId) &&
     (selectedConversation().type === 'group'
@@ -1671,16 +1875,47 @@ async function handleRequestResponse(button) {
 async function handleUnfriend(friendId) {
   const friend = state.friends.find((person) => String(person.id) === String(friendId));
   const friendName = friend?.name || 'this friend';
-  const confirmed = window.confirm(`Remove ${friendName} from your friends list? This will also delete the direct chat.`);
+  const confirmed = window.confirm(`Remove ${friendName} from your friends list? Your chat history will be kept if you add them again.`);
   if (!confirmed) return;
 
   await api(`/friends/${encodeURIComponent(friendId)}`, { method: 'DELETE' });
+  if (state.activeRoomId) window.chatSocket?.leaveConversation(state.activeRoomId);
   state.selectedConversationId = null;
   state.messages = [];
   state.activeRoomId = null;
   state.joinedRoomId = null;
+  stopLocalTyping();
+  clearTypingIndicator();
+  render();
   await refreshData();
   showNotice('Friend removed.', 'success');
+}
+
+async function handleBlockUser(userId) {
+  const friend = state.friends.find((person) => String(person.id) === String(userId));
+  const userName = friend?.name || 'this user';
+  if (!window.confirm(`Block ${userName}? They will no longer be able to contact you directly.`)) return;
+
+  await api(`/users/${encodeURIComponent(userId)}/block`, { method: 'POST' });
+  if (String(selectedConversation()?.friend?.id) === String(userId)) {
+    if (state.activeRoomId) window.chatSocket?.leaveConversation(state.activeRoomId);
+    state.selectedConversationId = null;
+    state.messages = [];
+    state.activeRoomId = null;
+    state.joinedRoomId = null;
+    stopLocalTyping();
+    clearTypingIndicator();
+    render();
+  }
+  await refreshData();
+  showNotice(`${userName} blocked. You can unblock them from Blocked users.`, 'success');
+}
+
+async function handleUnblockUser(userId) {
+  const blockedUser = state.blockedUsers.find((person) => String(person.id) === String(userId));
+  await api(`/users/${encodeURIComponent(userId)}/block`, { method: 'DELETE' });
+  await refreshData();
+  showNotice(`${blockedUser?.name || 'User'} unblocked.`, 'success');
 }
 
 async function handleLeaveGroup(conversationId) {
@@ -1770,6 +2005,7 @@ async function handleSendMessage(form) {
       method: 'POST',
       body: payload,
     });
+    await notifyMessageSent(conversation.id, sentMessage.id);
     field.value = '';
     state.replyTarget = null;
     updateReplyPreview();
@@ -2068,6 +2304,7 @@ app.addEventListener('submit', async (event) => {
     if (form.id === 'create-group-form') await handleCreateGroup(form);
     if (form.id === 'add-group-member-form') await handleAddGroupMember(form);
     if (form.id === 'message-form') await handleSendMessage(form);
+    if (form.id === 'forward-message-form') await handleForwardMessage(form);
   } catch (error) {
     showNotice(error.message || 'Something went wrong. Please try again.');
   }
@@ -2176,6 +2413,11 @@ app.addEventListener('click', async (event) => {
       const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
       if (!message) throw new Error('This message is no longer available.');
       beginReply(message);
+    } else if (action === 'forward-message') {
+      button.closest('.message-menu')?.removeAttribute('open');
+      const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
+      if (!message) throw new Error('This message is no longer available.');
+      renderForwardModal(message);
     } else if (action === 'copy-message') {
       button.closest('.message-menu')?.removeAttribute('open');
       const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
@@ -2200,6 +2442,11 @@ app.addEventListener('click', async (event) => {
       await handleRequestResponse(button);
     } else if (action === 'unfriend') {
       await handleUnfriend(id);
+    } else if (action === 'block-user') {
+      await handleBlockUser(id);
+    } else if (action === 'unblock-user') {
+      button.disabled = true;
+      await handleUnblockUser(id);
     } else if (action === 'leave-group') {
       await handleLeaveGroup(id);
     } else if (action === 'remove-group-member') {
@@ -2242,6 +2489,14 @@ app.addEventListener('input', (event) => {
 });
 
 app.addEventListener('change', (event) => {
+  if (event.target.matches('#forward-message-form input[name="target_conversation_ids"]')) {
+    const count = document.querySelector('#forward-selection-count');
+    if (count) {
+      const selectedCount = document.querySelectorAll('#forward-message-form input[name="target_conversation_ids"]:checked').length;
+      count.textContent = `${selectedCount} selected`;
+    }
+    return;
+  }
   if (event.target.matches('#create-group-form input[name="friend_ids"]')) {
     const friendId = String(event.target.value);
     if (event.target.checked) state.selectedGroupFriendIds.add(friendId);
