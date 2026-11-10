@@ -31,12 +31,17 @@ const app = document.querySelector('#app');
 
 const state = {
   apiUrl: normalizeApiUrl(readStoredValue(API_URL_KEY, 'daylight.apiUrl') || DEFAULT_API_URL),
-  socketUrl: readStoredValue(SOCKET_URL_KEY, 'daylight.socketUrl') || DEFAULT_SOCKET_URL,
+  socketUrl: DEFAULT_SOCKET_URL,
   token: readStoredValue(TOKEN_KEY, 'daylight.authToken'),
   user: readStoredUser(),
   authMode: 'login',
   friends: [],
   blockedUsers: [],
+  callHistory: [],
+  callHistoryPage: 0,
+  callHistoryLastPage: 1,
+  callHistoryLoading: false,
+  callHistoryError: '',
   requests: [],
   sidebarTool: null,
   friendSearchQuery: '',
@@ -396,6 +401,11 @@ function clearSession() {
   state.user = null;
   state.friends = [];
   state.requests = [];
+  state.callHistory = [];
+  state.callHistoryPage = 0;
+  state.callHistoryLastPage = 1;
+  state.callHistoryError = '';
+  state.callHistoryLoading = false;
   state.conversations = [];
   state.unreadCount = null;
   window.desktopApp?.setUnreadCount(0, false);
@@ -505,6 +515,28 @@ function friendAvatar(user, size = 'sm', withPresence = false) {
   return `<span class="avatar-wrap">${avatar}<span class="presence-dot ${status}" aria-label="${status}"></span></span>`;
 }
 
+function userProfileButton(user, size = 'sm', withPresence = false) {
+  if (!user?.id) return friendAvatar(user, size, withPresence);
+  return `<button class="user-profile-trigger" type="button" data-action="open-user-profile" data-id="${escapeHtml(user.id)}" aria-label="View ${escapeHtml(user.name || 'user')}'s profile" title="View profile">${friendAvatar(user, size, withPresence)}</button>`;
+}
+
+function userForProfile(userId) {
+  const key = String(userId);
+  if (String(state.user?.id) === key) return state.user;
+  const users = [
+    ...state.friends,
+    ...state.blockedUsers,
+    ...state.requests.map((request) => request.user),
+    ...state.conversations.flatMap((conversation) => [
+      conversation.friend,
+      ...(conversation.participants || []),
+    ]),
+    ...state.callHistory.map((call) => call.contact),
+    ...state.messages.map((message) => message.sender),
+  ];
+  return users.find((user) => String(user?.id) === key) || null;
+}
+
 function selectedConversation() {
   return state.conversations.find((item) => String(item.id) === String(state.selectedConversationId)) || null;
 }
@@ -542,28 +574,35 @@ function conversationAvatar(conversation, size = 'sm', withPresence = false) {
 function messageAvatar(message) {
   const conversation = selectedConversation();
   if (conversation?.type !== 'group') {
-    return friendAvatar(conversation?.friend, 'message-avatar');
+    return userProfileButton(conversation?.friend, 'message-avatar');
   }
   const sender = conversation.participants?.find((participant) =>
     String(participant.id) === String(message.sender?.id));
-  return friendAvatar(sender || message.sender, 'message-avatar');
+  return userProfileButton(sender || message.sender, 'message-avatar');
 }
 
 function showChatShell() {
   app.innerHTML = `
     <div class="app-shell ${state.selectedConversationId ? 'chat-open' : ''}">
-      <aside class="rail">
-        <div class="friend-toolbar" aria-label="Friend list actions">
-          <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="search" aria-label="Search friends" aria-expanded="false" title="Search friends"><span aria-hidden="true">⌕</span><span>Search</span></button>
-          <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="add" aria-label="Add a friend" aria-expanded="false" title="Add a friend"><span aria-hidden="true">＋</span><span>Add</span></button>
-          <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="group" aria-label="Create a group" aria-expanded="false" title="Create a group"><span aria-hidden="true">◎</span><span>Group</span></button>
-          <button class="rail-tool request-tool" type="button" data-action="toggle-sidebar-tool" data-tool="requests" aria-label="Friend requests" aria-expanded="false" title="Friend requests"><span aria-hidden="true">✉</span><span>Requests</span><span class="tool-badge" id="request-count" hidden></span></button>
-          <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="blocked" aria-label="Blocked users" aria-expanded="false" title="Blocked users"><span aria-hidden="true">⊘</span><span>Blocked</span></button>
-          <button class="rail-tool" type="button" data-action="refresh" aria-label="Refresh friends and messages" title="Refresh"><span aria-hidden="true">↻</span><span>Sync</span></button>
-          <button class="rail-tool" type="button" data-action="toggle-sidebar-tool" data-tool="updates" aria-label="Check app updates" aria-expanded="false" title="App updates"><span aria-hidden="true">⋯</span><span>Updates</span></button>
+      <nav class="app-nav" aria-label="Main navigation">
+        <div class="app-nav-primary">
+          <span class="app-nav-brand brand-mark" aria-label="PITBConnect">P</span>
+          <button class="app-nav-button" type="button" data-action="show-friends" aria-label="Chats" title="Chats"><span aria-hidden="true">▤</span></button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="search" aria-label="Search" aria-expanded="false" title="Search"><span aria-hidden="true">⌕</span></button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="add" aria-label="Add a friend" aria-expanded="false" title="Add a friend"><span aria-hidden="true">＋</span></button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="group" aria-label="Create a group" aria-expanded="false" title="Create a group"><span aria-hidden="true">◎</span></button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="calls" aria-label="Call history" aria-expanded="false" title="Call history"><span aria-hidden="true">☎</span></button>
+          <button class="app-nav-button request-tool" type="button" data-action="toggle-sidebar-tool" data-tool="requests" aria-label="Friend requests" aria-expanded="false" title="Friend requests"><span aria-hidden="true">✉</span><span class="tool-badge" id="request-count" hidden></span></button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="blocked" aria-label="Blocked users" aria-expanded="false" title="Blocked users"><span aria-hidden="true">⊘</span></button>
         </div>
+        <div class="app-nav-secondary">
+          <button class="app-nav-button" type="button" data-action="refresh" aria-label="Sync chats" title="Sync chats"><span aria-hidden="true">↻</span></button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="updates" aria-label="App updates" aria-expanded="false" title="App updates"><span aria-hidden="true">⋯</span></button>
+        </div>
+      </nav>
+      <aside class="rail">
         <div class="sidebar-tools" id="sidebar-tools" hidden></div>
-        <div class="friend-list-heading"><h2>Friends</h2><span class="unread-total" id="unread-message-count" hidden></span></div>
+        <div class="friend-list-heading"><h2>Chats</h2><span class="unread-total" id="unread-message-count" hidden></span></div>
         <div class="friend-list" id="friend-list"></div>
         <div class="profile">
           <button class="profile-avatar-button" type="button" data-action="open-profile" aria-label="Open profile" title="Open profile">
@@ -597,6 +636,8 @@ function renderSidebar() {
     button.classList.toggle('active', active);
     button.setAttribute('aria-expanded', String(active));
   });
+  const chatsButton = document.querySelector('.app-nav-button[data-action="show-friends"]');
+  if (chatsButton) chatsButton.classList.toggle('active', !state.sidebarTool);
   toolsPanel.hidden = !state.sidebarTool;
   const focusedInput = document.activeElement instanceof HTMLInputElement &&
     toolsPanel.contains(document.activeElement) &&
@@ -659,8 +700,8 @@ function renderSidebarTool() {
         <div class="request-list">${state.requests.length
           ? state.requests.map((request) => `
             <div class="request-row">
-              ${friendAvatar(request.user)}
-              <div class="request-info"><div class="person-name">${escapeHtml(request.user?.name)}</div><div class="person-sub">${escapeHtml(request.user?.phone)}</div></div>
+              ${userProfileButton(request.user)}
+              <button class="request-info user-profile-name" type="button" data-action="open-user-profile" data-id="${escapeHtml(request.user?.id)}"><span class="person-name">${escapeHtml(request.user?.name)}</span><span class="person-sub">${escapeHtml(request.user?.phone)}</span></button>
               <div class="request-actions">
                 <button type="button" data-action="respond-request" data-id="${escapeHtml(request.id)}" data-response="accept" title="Accept request" aria-label="Accept ${escapeHtml(request.user?.name)}">✓</button>
                 <button type="button" class="reject" data-action="respond-request" data-id="${escapeHtml(request.id)}" data-response="reject" title="Reject request" aria-label="Reject ${escapeHtml(request.user?.name)}">×</button>
@@ -670,6 +711,36 @@ function renderSidebarTool() {
         </div>
       </section>`;
   }
+  if (state.sidebarTool === 'calls') {
+    return `
+      <section class="tool-section" aria-label="Call history">
+        <div class="call-history-heading"><h2>Call history</h2><button class="small-button" type="button" data-action="refresh-call-history" ${state.callHistoryLoading ? 'disabled' : ''}>Refresh</button></div>
+        ${state.callHistoryError
+          ? `<div class="empty-list call-history-error">${escapeHtml(state.callHistoryError)} <button class="text-button" type="button" data-action="refresh-call-history">Try again</button></div>`
+          : state.callHistoryLoading && state.callHistoryPage === 0
+            ? '<div class="empty-list">Loading call history…</div>'
+            : state.callHistory.length
+              ? `<div class="call-history-list">${state.callHistory.map((call) => {
+                const missed = call.status === 'missed';
+                const mediaLabel = call.media_type === 'video' ? 'Video call' : 'Voice call';
+                const statusLabel = missed ? 'Missed' : formatCallDuration(call.duration_seconds);
+                const directionLabel = call.direction === 'outgoing' ? 'Outgoing' : 'Incoming';
+                return `<article class="call-history-entry${missed ? ' missed' : ''}">
+                  ${userProfileButton(call.contact, 'sm')}
+                  <div class="call-history-info">
+                    <strong>${escapeHtml(call.contact?.name || 'Unknown contact')}</strong>
+                    <span>${directionLabel} · ${mediaLabel} · ${statusLabel}</span>
+                    <time>${escapeHtml(formattedDay(call.created_at))} · ${escapeHtml(formattedTime(call.created_at))}</time>
+                  </div>
+                  <span class="call-history-direction" aria-label="${directionLabel}">${call.direction === 'outgoing' ? '↗' : '↙'}</span>
+                </article>`;
+              }).join('')}</div>
+              ${state.callHistoryPage < state.callHistoryLastPage
+                ? `<button class="small-button call-history-more" type="button" data-action="load-more-call-history" ${state.callHistoryLoading ? 'disabled' : ''}>${state.callHistoryLoading ? 'Loading…' : 'Load older calls'}</button>`
+                : ''}`
+              : '<div class="empty-list">No call history yet. Calls will appear here after you call or receive a call.</div>'}
+      </section>`;
+  }
   if (state.sidebarTool === 'blocked') {
     return `
       <section class="tool-section" aria-label="Blocked users">
@@ -677,8 +748,8 @@ function renderSidebarTool() {
         <div class="request-list">${state.blockedUsers.length
           ? state.blockedUsers.map((user) => `
             <div class="request-row">
-              ${friendAvatar(user)}
-              <div class="request-info"><div class="person-name">${escapeHtml(user.name)}</div><div class="person-sub">${escapeHtml(user.phone)}</div></div>
+              ${userProfileButton(user)}
+              <button class="request-info user-profile-name" type="button" data-action="open-user-profile" data-id="${escapeHtml(user.id)}"><span class="person-name">${escapeHtml(user.name)}</span><span class="person-sub">${escapeHtml(user.phone)}</span></button>
               <div class="request-actions">
                 <button type="button" data-action="unblock-user" data-id="${escapeHtml(user.id)}" title="Unblock ${escapeHtml(user.name)}" aria-label="Unblock ${escapeHtml(user.name)}">↩</button>
               </div>
@@ -718,17 +789,20 @@ function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.f
       const unreadCount = Number(conversation?.unread_count) || 0;
       const lastMessage = conversation?.last_message;
       const preview = messagePreview(lastMessage, 'Start a conversation');
-      const messagePreview = lastMessage && String(lastMessage.sender?.id) === String(state.user.id)
+      const previewText = lastMessage && String(lastMessage.sender?.id) === String(state.user.id)
         ? `You: ${preview}`
         : preview;
       return `
-        <button class="friend-item ${String(selectedConversation()?.friend?.id) === String(friend.id) ? 'active' : ''} ${unreadCount ? 'has-unread' : ''}" type="button" data-action="open-friend" data-id="${escapeHtml(friend.id)}" aria-label="Chat with ${escapeHtml(friend.name)}${unreadCount ? `, ${unreadCount} unread messages` : ''}">
-          ${friendAvatar(friend, 'sm', true)}
-          <span class="person-info"><span class="person-name">${escapeHtml(friend.name)}</span><span class="conversation-preview">${escapeHtml(messagePreview)}</span></span>
-          <span class="conversation-meta">${lastMessage ? formattedTime(lastMessage.created_at) : ''}
+        <div class="friend-item ${String(selectedConversation()?.friend?.id) === String(friend.id) ? 'active' : ''} ${unreadCount ? 'has-unread' : ''}">
+          ${userProfileButton(friend, 'sm', true)}
+          <div class="person-info friend-item-main">
+            <button class="user-profile-name" type="button" data-action="open-user-profile" data-id="${escapeHtml(friend.id)}">${escapeHtml(friend.name)}</button>
+            <button class="conversation-preview friend-item-open-chat" type="button" data-action="open-friend" data-id="${escapeHtml(friend.id)}">${escapeHtml(previewText)}</button>
+          </div>
+          <div class="conversation-meta">${lastMessage ? formattedTime(lastMessage.created_at) : ''}
             ${unreadCount ? `<span class="counter">${escapeHtml(unreadCount)}</span>` : ''}
-          </span>
-        </button>`;
+          </div>
+        </div>`;
     }).join('')
     : state.friends.length || state.conversations.some((conversation) => conversation.type === 'group')
       ? '<div class="empty-list">No friends match your search.</div>'
@@ -771,8 +845,9 @@ function renderThread() {
   panel.innerHTML = `
     <header class="chat-header">
       <button class="icon-button back-to-friends" type="button" data-action="show-friends" title="Back to friends" aria-label="Back to friends">‹</button>
-      ${conversationAvatar(conversation, 'lg', conversation.type !== 'group')}
-      <div class="chat-heading"><h2>${escapeHtml(conversationTitle(conversation))}</h2><p id="chat-status" title="${escapeHtml(conversation.type === 'group' ? `${groupMembers.length} group members` : presenceText(conversation.friend?.id))}">${conversation.type === 'group' ? `${groupMembers.length} members` : presenceText(conversation.friend?.id)}</p></div>
+      ${conversation.type === 'group'
+        ? `${conversationAvatar(conversation, 'lg')}<div class="chat-heading"><h2>${escapeHtml(conversationTitle(conversation))}</h2><p id="chat-status" title="${groupMembers.length} group members">${groupMembers.length} members</p></div>`
+        : `<button class="chat-user-profile" type="button" data-action="open-user-profile" data-id="${escapeHtml(conversation.friend?.id)}" aria-label="View ${escapeHtml(conversation.friend?.name || 'friend')}'s profile" title="View profile">${friendAvatar(conversation.friend, 'lg', true)}<span class="chat-heading"><h2>${escapeHtml(conversationTitle(conversation))}</h2><p id="chat-status" title="${escapeHtml(presenceText(conversation.friend?.id))}">${presenceText(conversation.friend?.id)}</p></span></button>`}
       <div class="chat-actions">
         ${conversation.type === 'group' ? `<button class="icon-button group-members-button" type="button" data-action="open-group-members" data-id="${escapeHtml(conversation.id)}" title="View group members" aria-label="View ${groupMembers.length} group members"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 19v-1a6 6 0 0 1 12 0v1"/><path d="M16 5.5a3 3 0 0 1 0 5.8M18 14a5 5 0 0 1 3 4.5v.5"/></svg><span class="group-member-count">${groupMembers.length}</span></button>` : ''}
         <button class="icon-button" type="button" data-action="unfriend" data-id="${escapeHtml(conversation.friend?.id)}" title="Remove friend" aria-label="Remove ${escapeHtml(conversation.friend?.name || 'friend')}" ${conversation.type === 'group' ? 'hidden' : ''}>✕</button>
@@ -821,6 +896,25 @@ function renderProfileModal() {
     </div>`;
 }
 
+function renderUserProfileModal(user) {
+  const modalRoot = document.querySelector('#modal-root');
+  if (!modalRoot || !user?.id) return;
+  const isFriend = state.friends.some((friend) => String(friend.id) === String(user.id));
+  const online = state.socketConnected && isOnline(user.id);
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <section class="app-modal profile-modal" role="dialog" aria-modal="true" aria-labelledby="user-profile-title">
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Close profile">×</button>
+        <h2 id="user-profile-title">Profile</h2>
+        <div class="profile-modal-avatar">${friendAvatar(user, 'lg')}</div>
+        <div class="profile-modal-name">${escapeHtml(user.name || 'User')}</div>
+        <div class="profile-modal-phone">${escapeHtml(user.phone || 'Phone number not available')}</div>
+        <div class="profile-user-status"><span class="presence-dot ${online ? 'online' : 'offline'}"></span>${online ? 'Online' : 'Offline'}</div>
+        ${isFriend ? `<button class="primary-button profile-change-button" type="button" data-action="profile-open-chat" data-id="${escapeHtml(user.id)}">Message</button>` : ''}
+      </section>
+    </div>`;
+}
+
 function renderGroupMembersModal(conversation) {
   const modalRoot = document.querySelector('#modal-root');
   if (!modalRoot || conversation?.type !== 'group') return;
@@ -838,8 +932,8 @@ function renderGroupMembersModal(conversation) {
         <div class="modal-member-list">
           ${members.map((member) => `
             <div class="modal-member-row">
-              ${friendAvatar(member, 'sm')}
-              <span class="modal-member-name">${escapeHtml(member.name)}</span>
+              ${userProfileButton(member, 'sm')}
+              <button class="modal-member-name user-profile-name" type="button" data-action="open-user-profile" data-id="${escapeHtml(member.id)}">${escapeHtml(member.name)}</button>
               ${String(member.id) === String(state.user.id)
                 ? `<span class="group-member-role">${isCreator ? 'Creator' : 'You'}</span>`
                 : isCreator
@@ -1174,7 +1268,7 @@ function formatFileSize(size) {
     : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-async function loadMessages({ markRead = true } = {}) {
+async function loadMessages({ markRead = true, cacheImages = true } = {}) {
   const conversation = selectedConversation();
   if (!conversation) {
     state.messages = [];
@@ -1191,13 +1285,19 @@ async function loadMessages({ markRead = true } = {}) {
     renderSidebar();
     syncUnreadIndicators();
   }
-  await cacheMessageImages(conversation.id, state.messages);
+  if (cacheImages) await cacheMessageImages(conversation.id, state.messages);
 }
 
 async function notifyMessageSent(conversationId, messageId) {
-  if (!window.chatSocket) return;
+  if (!window.chatSocket || !state.socketConnected) {
+    showNotice('Message sent, but realtime is disconnected. It will sync when the connection is restored.');
+    return;
+  }
   try {
-    await window.chatSocket.notifyMessage(conversationId, messageId);
+    const sent = await window.chatSocket.notifyMessage(conversationId, messageId);
+    if (!sent) {
+      showNotice('Message sent, but realtime is disconnected. It will sync when the connection is restored.');
+    }
   } catch (error) {
     showNotice(`Message sent, but its real-time update could not be published: ${error.message}`);
   }
@@ -1352,6 +1452,7 @@ async function persistCallSummary(payload) {
     },
   });
 
+  if (state.sidebarTool === 'calls') void loadCallHistory();
   if (String(state.selectedConversationId) !== String(conversationId)) return;
   state.messages = [message, ...state.messages.filter((item) => String(item.id) !== String(message.id))];
   state.conversations = state.conversations.map((conversation) =>
@@ -1360,6 +1461,27 @@ async function persistCallSummary(payload) {
       : conversation);
   renderFriendList();
   renderMessages();
+}
+
+async function loadCallHistory({ append = false } = {}) {
+  if (state.callHistoryLoading) return;
+  const page = append ? state.callHistoryPage + 1 : 1;
+  state.callHistoryLoading = true;
+  state.callHistoryError = '';
+  renderSidebar();
+
+  try {
+    const result = await api(`/call-history?page=${page}`);
+    if (!Array.isArray(result.data)) throw new Error('The server returned an invalid call history response.');
+    state.callHistory = append ? [...state.callHistory, ...result.data] : result.data;
+    state.callHistoryPage = Number(result.current_page) || page;
+    state.callHistoryLastPage = Number(result.last_page) || 1;
+  } catch (error) {
+    state.callHistoryError = error.message || 'Call history could not be loaded.';
+  } finally {
+    state.callHistoryLoading = false;
+    if (state.sidebarTool === 'calls') renderSidebar();
+  }
 }
 
 function stopCall(message) {
@@ -1435,6 +1557,11 @@ async function createPeerConnection(call, initiator) {
   state.localStream = localStream;
   state.peerConnection = peer;
   for (const track of localStream.getTracks()) peer.addTrack(track, localStream);
+  const notifyCallConnected = () => {
+    if (state.call?.id !== call.id || state.call.connectedNotified) return;
+    state.call.connectedNotified = true;
+    void sendCallEvent('call:connected', { call_id: call.id });
+  };
   peer.onicecandidate = ({ candidate }) => {
     if (candidate && state.call?.id === call.id) {
       void sendCallEvent('call:signal', {
@@ -1457,10 +1584,7 @@ async function createPeerConnection(call, initiator) {
   peer.onconnectionstatechange = () => {
     if (state.call?.id !== call.id) return;
     if (peer.connectionState === 'connected') {
-      if (!state.call.connectedNotified) {
-        state.call.connectedNotified = true;
-        void sendCallEvent('call:connected', { call_id: call.id });
-      }
+      notifyCallConnected();
       updateCall({ phase: 'active' });
     }
     if (peer.connectionState === 'failed') {
@@ -1473,6 +1597,7 @@ async function createPeerConnection(call, initiator) {
     if (peer.iceConnectionState === 'checking') {
       updateCall({ phase: 'connecting', connectionStatus: 'Connecting media…' });
     } else if (peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed') {
+      notifyCallConnected();
       updateCall({ phase: 'active', connectionStatus: '' });
     } else if (peer.iceConnectionState === 'disconnected') {
       updateCall({ connectionStatus: 'Reconnecting media…' });
@@ -1642,6 +1767,7 @@ function handleSocketEvent(event, payload) {
   } else if (event === 'disconnect' || event === 'connect_error') {
     if (event === 'disconnect' && state.call) stopCall('Realtime connection lost; the call ended.');
     state.socketConnected = false;
+    startPolling();
     state.activeRoomId = null;
     state.joinedRoomId = null;
     state.onlineFriendIds.clear();
@@ -1674,7 +1800,29 @@ function handleSocketEvent(event, payload) {
   } else if (event === 'conversation:message' &&
     Number.isSafeInteger(Number(payload?.conversation_id)) &&
     Number.isSafeInteger(Number(payload?.message_id))) {
-    void refreshData();
+    if (String(payload.conversation_id) === String(state.selectedConversationId)) {
+      const conversationId = String(state.selectedConversationId);
+      void loadMessages({ markRead: false, cacheImages: false }).then(() => {
+        if (String(state.selectedConversationId) !== conversationId) return;
+        renderMessages();
+        renderSidebar();
+        void cacheMessageImages(conversationId, state.messages);
+        if (document.hasFocus() && state.messages.some((message) =>
+          String(message.sender?.id) !== String(state.user.id) && !message.read_at)) {
+          void api(`/conversations/${encodeURIComponent(conversationId)}/read`, { method: 'POST' })
+            .then(() => loadMessages({ markRead: false, cacheImages: false }))
+            .then(() => {
+              if (String(state.selectedConversationId) === conversationId) {
+                renderMessages();
+                renderSidebar();
+              }
+            })
+            .catch((error) => showNotice(`Message received, but read status could not be updated: ${error.message}`));
+        }
+      }).catch((error) => showNotice(`A new message arrived, but could not be loaded: ${error.message}`));
+    } else {
+      void refreshData();
+    }
   } else if (event === 'conversation:typing' && selectedConversation() &&
     String(payload?.conversation_id) === String(state.selectedConversationId) &&
     (selectedConversation().type === 'group'
@@ -2355,11 +2503,20 @@ app.addEventListener('click', async (event) => {
     } else if (action === 'toggle-sidebar-tool') {
       state.sidebarTool = state.sidebarTool === button.dataset.tool ? null : button.dataset.tool;
       renderSidebar();
+      if (state.sidebarTool === 'calls') void loadCallHistory();
       if (state.sidebarTool === 'search') {
         document.querySelector('#friend-search')?.focus();
       }
     } else if (action === 'open-profile') {
       renderProfileModal();
+    } else if (action === 'open-user-profile') {
+      const user = userForProfile(id);
+      if (!user) throw new Error('This user profile is no longer available.');
+      if (String(user.id) === String(state.user?.id)) renderProfileModal();
+      else renderUserProfileModal(user);
+    } else if (action === 'profile-open-chat') {
+      closeModal();
+      await openFriend(id);
     } else if (action === 'open-group-members') {
       const conversation = state.conversations.find((item) =>
         String(item.id) === String(id) && item.type === 'group');
@@ -2381,6 +2538,11 @@ app.addEventListener('click', async (event) => {
         await loadMessages();
         renderMessages();
       }
+      if (state.sidebarTool === 'calls') await loadCallHistory();
+    } else if (action === 'refresh-call-history') {
+      await loadCallHistory();
+    } else if (action === 'load-more-call-history') {
+      await loadCallHistory({ append: true });
     } else if (action === 'call-audio' || action === 'call-video') {
       await startCall(action === 'call-video' ? 'video' : 'audio');
     } else if (action === 'choose-attachment') {

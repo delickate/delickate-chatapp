@@ -71,6 +71,7 @@ const CALL_CLIENT_EVENTS = new Set([
   'call:reject',
   'call:cancel',
   'call:end',
+  'call:connected',
   'call:signal',
 ]);
 let mainWindow;
