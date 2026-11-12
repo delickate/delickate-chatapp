@@ -4,6 +4,8 @@ const API_URL_KEY = 'pitbconnect.apiUrl';
 const TOKEN_KEY = 'pitbconnect.authToken';
 const USER_KEY = 'pitbconnect.currentUser';
 const SOCKET_URL_KEY = 'pitbconnect.socketUrl';
+const SETTINGS_KEY = 'pitbconnect.settings';
+const DEFAULT_SETTINGS = { notifications: true, blurMessages: false };
 const DEFAULT_API_URL = 'https://api.sanjakarobar.com/api';
 const DEFAULT_SOCKET_URL = 'https://socket.sanjakarobar.com';
 const REFRESH_INTERVAL = 5000;
@@ -18,6 +20,16 @@ const CACHED_IMAGE_TYPES = new Set([
   'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp', 'image/avif',
 ]);
 const TYPING_TIMEOUT = 1400;
+const MAX_VOICE_SECONDS = 300;
+// Protected messages: 20 characters from a 32-symbol alphabet without look-alike
+// characters (no I, O, 0, 1) gives 100 bits of randomness, far beyond what can
+// be guessed even by someone holding the stored ciphertext.
+const PROTECTED_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const PROTECTED_PASSWORD_LENGTH = 20;
+const PROTECTED_KDF_ITERATIONS = 600000;
+const MAX_PROTECTED_LENGTH = 2000;
+const MIN_VOICE_MILLISECONDS = 1000;
+const VOICE_MIME_TYPES = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm'];
 const EMOJI_OPTIONS = [
   ['😀', 'Grinning face'], ['😂', 'Face with tears of joy'], ['🥰', 'Smiling face with hearts'],
   ['😊', 'Smiling face'], ['😍', 'Heart eyes'], ['😎', 'Sunglasses face'], ['😭', 'Loudly crying face'],
@@ -48,9 +60,12 @@ const state = {
   addFriendPhone: '',
   groupName: '',
   selectedGroupFriendIds: new Set(),
+  groupFriendQuery: '',
   conversations: [],
   groupMembershipRevisions: new Map(),
   unreadCount: null,
+  unreadByConversation: null,
+  settings: readSettings(),
   selectedConversationId: null,
   messages: [],
   replyTarget: null,
@@ -82,8 +97,32 @@ const state = {
   remoteStream: null,
   pendingIceCandidates: [],
   pendingCallSignals: [],
+  groupPeers: new Map(),
+  recentGroupCallIds: new Set(),
   iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  voiceRecording: null,
+  voicePlayer: null,
+  voiceBlobUrls: new Map(),
+  unlockedMessages: new Map(),
 };
+
+// Line icons for the left navigation (24px grid, drawn with currentColor).
+const NAV_ICONS = {
+  chats: '<path d="M21 11.5a8.5 8.5 0 0 1-12.3 7.6L3.5 20.5l1.4-4.9A8.5 8.5 0 1 1 21 11.5Z"/><path d="M8.5 10h7M8.5 13.5h4.5"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20.5 20.5-4.5-4.5"/>',
+  addFriend: '<circle cx="9.5" cy="8" r="4"/><path d="M2.5 20.5v-.5a7 7 0 0 1 11.2-5.6"/><path d="M19 14v6.5M15.75 17.25h6.5"/>',
+  group: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20.5V20a6.5 6.5 0 0 1 13 0v.5"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8M18 14.2a6.5 6.5 0 0 1 3.5 5.8v.5"/>',
+  calls: '<path d="M7.2 3.8 9.5 3.3a1.6 1.6 0 0 1 1.8 1.1l.8 2.8a1.6 1.6 0 0 1-.7 1.8l-1.6 1.1a14 14 0 0 0 4.1 4.1l1.1-1.6a1.6 1.6 0 0 1 1.8-.7l2.8.8a1.6 1.6 0 0 1 1.1 1.8l-.5 2.3a2 2 0 0 1-2 1.6A15.5 15.5 0 0 1 5.6 5.8a2 2 0 0 1 1.6-2Z"/>',
+  requests: '<path d="M21.5 12.5h-5.5l-2 3h-4l-2-3H2.5"/><path d="M5.6 5.2 2.5 12.5v5.5a2 2 0 0 0 2 2h15a2 2 0 0 0 2-2v-5.5l-3.1-7.3A2 2 0 0 0 16.6 4H7.4a2 2 0 0 0-1.8 1.2Z"/>',
+  blocked: '<circle cx="12" cy="12" r="8.5"/><path d="m6 6 12 12"/>',
+  sync: '<path d="M20 11a8 8 0 0 0-14.6-4.5L3.5 9"/><path d="M3.5 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.5l1.9-2.5"/><path d="M20.5 20v-5h-5"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/>',
+  updates: '<path d="M12 3.5v11"/><path d="m7.5 10 4.5 4.5 4.5-4.5"/><path d="M4.5 19.5h15"/>',
+};
+
+function navIcon(name) {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[name]}</svg>`;
+}
 
 function normalizeApiUrl(value) {
   const raw = String(value ?? '').trim();
@@ -115,6 +154,32 @@ function readStoredValue(key, legacyKey) {
   return legacyValue;
 }
 
+function readSettings() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+    return {
+      notifications: typeof stored.notifications === 'boolean' ? stored.notifications : DEFAULT_SETTINGS.notifications,
+      blurMessages: typeof stored.blurMessages === 'boolean' ? stored.blurMessages : DEFAULT_SETTINGS.blurMessages,
+    };
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+function updateSettings(patch) {
+  state.settings = { ...state.settings, ...patch };
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+  } catch {
+    showNotice('Settings could not be saved on this computer; they will reset when the app restarts.');
+  }
+  applySettings();
+}
+
+function applySettings() {
+  document.body.classList.toggle('blur-messages', state.settings.blurMessages);
+}
+
 function readStoredUser() {
   try {
     return JSON.parse(readStoredValue(USER_KEY, 'daylight.currentUser') || 'null');
@@ -125,12 +190,10 @@ function readStoredUser() {
 
 function updateCallButtons() {
   const available = Boolean(state.joinedRoomId &&
-    String(state.joinedRoomId) === String(state.selectedConversationId) &&
-    selectedConversation()?.type !== 'group');
+    String(state.joinedRoomId) === String(state.selectedConversationId));
   document.querySelectorAll('[data-action="call-audio"], [data-action="call-video"]')
     .forEach((button) => {
       button.disabled = !available;
-      button.hidden = selectedConversation()?.type === 'group';
     });
 }
 
@@ -213,7 +276,21 @@ function messagePreview(message, fallback = '') {
       ? `Missed ${mediaName} call`
       : `${mediaName === 'video' ? 'Video' : 'Voice'} call · ${formatCallDuration(message.call.duration_seconds)}`;
   }
+  if (message?.type === 'protected') return '🔒 Protected message';
+  if (message?.type === 'voice') {
+    return message.voice ? `🎤 Voice message (${formatCallDuration(message.voice.duration_seconds)})` : '🎤 Voice message';
+  }
   return message?.body || message?.attachment?.name || fallback;
+}
+
+// One-line description of a message for reply quotes and dialogs.
+function messageSummary(message) {
+  if (!message) return 'Attachment';
+  if (message.unavailable) return 'Original message unavailable';
+  if (message.deleted_for_everyone_at) return 'This message was deleted';
+  if (message.type === 'voice') return '🎤 Voice message';
+  if (message.type === 'protected') return '🔒 Protected message';
+  return message.body || message.attachment?.name || 'Attachment';
 }
 
 function formattedDay(value) {
@@ -397,6 +474,9 @@ async function cacheMessageImages(conversationId, messages) {
 function clearSession() {
   window.chatSocket?.disconnect().catch(() => {});
   cleanupCall();
+  cancelVoiceRecording();
+  releaseVoiceBlobs();
+  state.unlockedMessages.clear();
   state.token = null;
   state.user = null;
   state.friends = [];
@@ -408,6 +488,7 @@ function clearSession() {
   state.callHistoryLoading = false;
   state.conversations = [];
   state.unreadCount = null;
+  state.unreadByConversation = null;
   window.desktopApp?.setUnreadCount(0, false);
   state.messages = [];
   state.replyTarget = null;
@@ -587,17 +668,18 @@ function showChatShell() {
       <nav class="app-nav" aria-label="Main navigation">
         <div class="app-nav-primary">
           <span class="app-nav-brand brand-mark" aria-label="PITBConnect">P</span>
-          <button class="app-nav-button" type="button" data-action="show-friends" aria-label="Chats" title="Chats"><span aria-hidden="true">▤</span></button>
-          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="search" aria-label="Search" aria-expanded="false" title="Search"><span aria-hidden="true">⌕</span></button>
-          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="add" aria-label="Add a friend" aria-expanded="false" title="Add a friend"><span aria-hidden="true">＋</span></button>
-          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="group" aria-label="Create a group" aria-expanded="false" title="Create a group"><span aria-hidden="true">◎</span></button>
-          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="calls" aria-label="Call history" aria-expanded="false" title="Call history"><span aria-hidden="true">☎</span></button>
-          <button class="app-nav-button request-tool" type="button" data-action="toggle-sidebar-tool" data-tool="requests" aria-label="Friend requests" aria-expanded="false" title="Friend requests"><span aria-hidden="true">✉</span><span class="tool-badge" id="request-count" hidden></span></button>
-          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="blocked" aria-label="Blocked users" aria-expanded="false" title="Blocked users"><span aria-hidden="true">⊘</span></button>
+          <button class="app-nav-button" type="button" data-action="show-friends" aria-label="Chats" title="Chats">${navIcon('chats')}</button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="search" aria-label="Search" aria-expanded="false" title="Search">${navIcon('search')}</button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="add" aria-label="Add a friend" aria-expanded="false" title="Add a friend">${navIcon('addFriend')}</button>
+          <button class="app-nav-button" type="button" data-action="open-create-group" aria-label="Create a group" aria-haspopup="dialog" title="Create a group">${navIcon('group')}</button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="calls" aria-label="Call history" aria-expanded="false" title="Call history">${navIcon('calls')}</button>
+          <button class="app-nav-button request-tool" type="button" data-action="toggle-sidebar-tool" data-tool="requests" aria-label="Friend requests" aria-expanded="false" title="Friend requests">${navIcon('requests')}<span class="tool-badge" id="request-count" hidden></span></button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="blocked" aria-label="Blocked users" aria-expanded="false" title="Blocked users">${navIcon('blocked')}</button>
         </div>
         <div class="app-nav-secondary">
-          <button class="app-nav-button" type="button" data-action="refresh" aria-label="Sync chats" title="Sync chats"><span aria-hidden="true">↻</span></button>
-          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="updates" aria-label="App updates" aria-expanded="false" title="App updates"><span aria-hidden="true">⋯</span></button>
+          <button class="app-nav-button" type="button" data-action="refresh" aria-label="Sync chats" title="Sync chats">${navIcon('sync')}</button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="settings" aria-label="Settings" aria-expanded="false" title="Settings">${navIcon('settings')}</button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="updates" aria-label="App updates" aria-expanded="false" title="App updates">${navIcon('updates')}</button>
         </div>
       </nav>
       <aside class="rail">
@@ -676,23 +758,6 @@ function renderSidebarTool() {
         </div>
       </form>`;
   }
-  if (state.sidebarTool === 'group') {
-    return `
-      <form class="create-group" id="create-group-form">
-        <label class="tool-field-label" for="group-name">New group</label>
-        <input id="group-name" name="name" type="text" maxlength="100" value="${escapeHtml(state.groupName)}" placeholder="Group title" required />
-        <div class="group-friend-options" role="group" aria-label="Choose friends">
-          ${state.friends.length
-            ? state.friends.map((friend) => `
-              <label class="group-friend-option">
-                <input type="checkbox" name="friend_ids" value="${escapeHtml(friend.id)}" ${state.selectedGroupFriendIds.has(String(friend.id)) ? 'checked' : ''} />
-                <span>${escapeHtml(friend.name)}</span>
-              </label>`).join('')
-            : '<span class="empty-list">Add friends before creating a group.</span>'}
-        </div>
-        <button class="small-button create-group-submit" type="submit" ${state.friends.length ? '' : 'disabled'}>Create group</button>
-      </form>`;
-  }
   if (state.sidebarTool === 'requests') {
     return `
       <section class="tool-section" aria-label="Friend requests">
@@ -722,13 +787,15 @@ function renderSidebarTool() {
             : state.callHistory.length
               ? `<div class="call-history-list">${state.callHistory.map((call) => {
                 const missed = call.status === 'missed';
-                const mediaLabel = call.media_type === 'video' ? 'Video call' : 'Voice call';
+                const mediaKind = call.media_type === 'video' ? 'video call' : 'voice call';
+                const mediaLabel = call.group ? `Group ${mediaKind}` : mediaKind.charAt(0).toUpperCase() + mediaKind.slice(1);
                 const statusLabel = missed ? 'Missed' : formatCallDuration(call.duration_seconds);
                 const directionLabel = call.direction === 'outgoing' ? 'Outgoing' : 'Incoming';
+                const contactName = call.group ? call.group.name || 'Group' : call.contact?.name || 'Unknown contact';
                 return `<article class="call-history-entry${missed ? ' missed' : ''}">
-                  ${userProfileButton(call.contact, 'sm')}
+                  ${call.group ? conversationAvatar({ type: 'group', name: call.group.name }, 'sm') : userProfileButton(call.contact, 'sm')}
                   <div class="call-history-info">
-                    <strong>${escapeHtml(call.contact?.name || 'Unknown contact')}</strong>
+                    <strong>${escapeHtml(contactName)}</strong>
                     <span>${directionLabel} · ${mediaLabel} · ${statusLabel}</span>
                     <time>${escapeHtml(formattedDay(call.created_at))} · ${escapeHtml(formattedTime(call.created_at))}</time>
                   </div>
@@ -756,6 +823,27 @@ function renderSidebarTool() {
             </div>`).join('')
           : '<div class="empty-list">You have not blocked anyone.</div>'}
         </div>
+      </section>`;
+  }
+  if (state.sidebarTool === 'settings') {
+    return `
+      <section class="tool-section settings-section" aria-label="Settings">
+        <h2>Settings</h2>
+        <label class="setting-row" for="setting-notifications">
+          <span class="setting-text">
+            <strong>Message notifications</strong>
+            <span>Show a desktop notification and flash the taskbar when a message arrives while the app is in the background.</span>
+          </span>
+          <input class="setting-switch" type="checkbox" role="switch" id="setting-notifications" ${state.settings.notifications ? 'checked' : ''}>
+        </label>
+        <label class="setting-row" for="setting-blur-messages">
+          <span class="setting-text">
+            <strong>Blur messages</strong>
+            <span>Blur message text, images, and chat previews until you point at them. Notifications will not show message content.</span>
+          </span>
+          <input class="setting-switch" type="checkbox" role="switch" id="setting-blur-messages" ${state.settings.blurMessages ? 'checked' : ''}>
+        </label>
+        <p class="setting-note">Settings are saved on this computer.</p>
       </section>`;
   }
   if (state.sidebarTool === 'updates') return updateControls();
@@ -852,8 +940,8 @@ function renderThread() {
         ${conversation.type === 'group' ? `<button class="icon-button group-members-button" type="button" data-action="open-group-members" data-id="${escapeHtml(conversation.id)}" title="View group members" aria-label="View ${groupMembers.length} group members"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 19v-1a6 6 0 0 1 12 0v1"/><path d="M16 5.5a3 3 0 0 1 0 5.8M18 14a5 5 0 0 1 3 4.5v.5"/></svg><span class="group-member-count">${groupMembers.length}</span></button>` : ''}
         <button class="icon-button" type="button" data-action="unfriend" data-id="${escapeHtml(conversation.friend?.id)}" title="Remove friend" aria-label="Remove ${escapeHtml(conversation.friend?.name || 'friend')}" ${conversation.type === 'group' ? 'hidden' : ''}>✕</button>
         <button class="icon-button" type="button" data-action="block-user" data-id="${escapeHtml(conversation.friend?.id)}" title="Block user" aria-label="Block ${escapeHtml(conversation.friend?.name || 'user')}" ${conversation.type === 'group' ? 'hidden' : ''}>⊘</button>
-        <button class="icon-button" type="button" data-action="call-audio" title="Start voice call" aria-label="Start voice call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.2 3.8 9.5 3.3a1.6 1.6 0 0 1 1.8 1.1l.8 2.8a1.6 1.6 0 0 1-.7 1.8l-1.6 1.1a14 14 0 0 0 4.1 4.1l1.1-1.6a1.6 1.6 0 0 1 1.8-.7l2.8.8a1.6 1.6 0 0 1 1.1 1.8l-.5 2.3a2 2 0 0 1-2 1.6A15.5 15.5 0 0 1 5.6 5.8a2 2 0 0 1 1.6-2Z"/></svg></button>
-        <button class="icon-button" type="button" data-action="call-video" title="Start video call" aria-label="Start video call" ${state.joinedRoomId && conversation.type !== 'group' ? '' : 'disabled'} ${conversation.type === 'group' ? 'hidden' : ''}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="12" height="12" rx="2"/><path d="m15 10 6-3v10l-6-3z"/></svg></button>
+        <button class="icon-button" type="button" data-action="call-audio" title="${conversation.type === 'group' ? 'Start group voice call' : 'Start voice call'}" aria-label="${conversation.type === 'group' ? 'Start group voice call' : 'Start voice call'}" ${state.joinedRoomId ? '' : 'disabled'}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.2 3.8 9.5 3.3a1.6 1.6 0 0 1 1.8 1.1l.8 2.8a1.6 1.6 0 0 1-.7 1.8l-1.6 1.1a14 14 0 0 0 4.1 4.1l1.1-1.6a1.6 1.6 0 0 1 1.8-.7l2.8.8a1.6 1.6 0 0 1 1.1 1.8l-.5 2.3a2 2 0 0 1-2 1.6A15.5 15.5 0 0 1 5.6 5.8a2 2 0 0 1 1.6-2Z"/></svg></button>
+        <button class="icon-button" type="button" data-action="call-video" title="${conversation.type === 'group' ? 'Start group video call' : 'Start video call'}" aria-label="${conversation.type === 'group' ? 'Start group video call' : 'Start video call'}" ${state.joinedRoomId ? '' : 'disabled'}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="12" height="12" rx="2"/><path d="m15 10 6-3v10l-6-3z"/></svg></button>
         <button class="icon-button" type="button" data-action="refresh" title="Refresh messages" aria-label="Refresh messages">↻</button>
       </div>
     </header>
@@ -861,6 +949,7 @@ function renderThread() {
     <div class="composer-wrap">
       <div class="attachment-preview" id="attachment-preview" aria-live="polite" hidden></div>
       <div class="reply-preview" id="reply-preview" hidden></div>
+      <div class="voice-recorder" id="voice-recorder" role="group" aria-label="Recording a voice message" hidden></div>
       <form class="composer" id="message-form">
         <textarea class="compose-input" name="body" rows="1" maxlength="10000" placeholder="Write a message…" aria-label="Write a message"></textarea>
         <div class="emoji-picker" id="emoji-picker" role="group" aria-label="Choose an emoji" hidden>
@@ -871,11 +960,14 @@ function renderThread() {
         <button class="emoji-button" type="button" data-action="toggle-emoji-picker" aria-label="Add emoji" aria-expanded="false" aria-controls="emoji-picker" title="Add emoji">☺</button>
         <input id="attachment-input" type="file" accept="image/*,.pdf,.txt,.rtf,.doc,.dot,.docx,.docm,.dotx,.dotm,.odt,.ppt,.pot,.pps,.pptx,.pptm,.ppsx,.odp,.xls,.xlt,.xlsx,.xlsm,.xlsb,.xltx,.xltm,.csv,.ods,.zip" hidden>
         <button class="attach-button" type="button" data-action="choose-attachment" aria-label="Attach a file" title="Attach a file">＋</button>
+        <button class="mic-button" type="button" data-action="open-protected-composer" aria-label="Send a password-protected message" title="Send a password-protected message"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3M12 14.5v2"/></svg></button>
+        <button class="mic-button" type="button" data-action="start-voice-recording" aria-label="Record a voice message" title="Record a voice message"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg></button>
         <button class="send-button" type="submit" aria-label="Send message">➤</button>
       </form>
     </div>`;
   renderMessages();
   updateReplyPreview();
+  renderVoiceRecorder();
 }
 
 function renderProfileModal() {
@@ -970,7 +1062,7 @@ function renderForwardModal(message) {
       <form class="app-modal forward-modal" id="forward-message-form" role="dialog" aria-modal="true" aria-labelledby="forward-modal-title" data-message-id="${escapeHtml(message.id)}" data-source-conversation-id="${escapeHtml(message.conversation_id)}">
         <button class="modal-close" type="button" data-action="close-modal" aria-label="Close forward dialog">×</button>
         <h2 id="forward-modal-title">Forward message</h2>
-        <p class="modal-subtitle">${escapeHtml(message.body || message.attachment?.name || 'Attachment')}</p>
+        <p class="modal-subtitle">${escapeHtml(messageSummary(message))}</p>
         <div class="forward-target-list">
           ${targets.length
             ? targets.map((conversation) => `
@@ -1046,6 +1138,105 @@ function updateGroupParticipants(conversationId, participants) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// New group dialog
+//
+// Rendered once when opened; later changes (typing, ticking friends) update
+// only the parts that change, so focus and scroll position are never lost.
+// ---------------------------------------------------------------------------
+
+function renderCreateGroupModal() {
+  const modalRoot = document.querySelector('#modal-root');
+  if (!modalRoot) return;
+  const friends = [...state.friends].sort((left, right) =>
+    String(left.name || '').localeCompare(String(right.name || '')));
+
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <form class="app-modal create-group-modal" id="create-group-form" role="dialog" aria-modal="true" aria-labelledby="create-group-title" novalidate>
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Close">×</button>
+        <h2 id="create-group-title">New group</h2>
+        <p class="modal-subtitle">Name your group and choose who to add. You can add more people later.</p>
+        ${friends.length ? `
+          <div class="create-group-identity">
+            <span class="avatar lg group-avatar" id="group-avatar-preview" aria-hidden="true"></span>
+            <label class="create-group-field">
+              <span>Group name</span>
+              <input id="group-name" name="name" type="text" maxlength="100" value="${escapeHtml(state.groupName)}" placeholder="e.g. Project team" autocomplete="off" required>
+            </label>
+          </div>
+          <div class="create-group-members-head">
+            <strong>Add members</strong>
+            <span id="group-selected-count" aria-live="polite"></span>
+          </div>
+          <div class="group-chips" id="group-chips"></div>
+          <div class="group-friend-search">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20.5 20.5-4.5-4.5"/></svg>
+            <input id="group-friend-search" type="search" value="${escapeHtml(state.groupFriendQuery)}" placeholder="Search friends by name or phone" aria-label="Search friends" autocomplete="off">
+          </div>
+          <div class="group-friend-list" role="group" aria-label="Friends">
+            ${friends.map((friend) => `
+              <label class="group-friend-row" data-search="${escapeHtml(`${friend.name || ''} ${friend.phone || ''}`.toLowerCase())}">
+                <input type="checkbox" name="friend_ids" value="${escapeHtml(friend.id)}" ${state.selectedGroupFriendIds.has(String(friend.id)) ? 'checked' : ''}>
+                ${friendAvatar(friend, 'sm')}
+                <span class="group-friend-text"><strong>${escapeHtml(friend.name)}</strong><span>${escapeHtml(friend.phone || '')}</span></span>
+                <span class="group-friend-check" aria-hidden="true"></span>
+              </label>`).join('')}
+            <div class="empty-list" id="group-no-match" hidden>No friends match your search.</div>
+          </div>
+          <footer class="create-group-actions">
+            <button class="secondary-button" type="button" data-action="close-modal">Cancel</button>
+            <button class="primary-button" type="submit" id="create-group-submit">Create group</button>
+          </footer>`
+        : `
+          <div class="create-group-empty">
+            <p>You need at least one friend to create a group.</p>
+            <button class="primary-button" type="button" data-action="open-add-friend-from-group">Add a friend</button>
+          </div>`}
+      </form>
+    </div>`;
+  updateCreateGroupView();
+  modalRoot.querySelector(state.groupName ? '#group-friend-search' : '#group-name')?.focus();
+}
+
+function updateCreateGroupView() {
+  const form = document.querySelector('#create-group-form');
+  if (!form) return;
+  const name = state.groupName.trim();
+  const selected = state.friends.filter((friend) => state.selectedGroupFriendIds.has(String(friend.id)));
+
+  const avatar = form.querySelector('#group-avatar-preview');
+  if (avatar) avatar.textContent = name ? initials(name) : '＋';
+
+  const count = form.querySelector('#group-selected-count');
+  if (count) count.textContent = selected.length ? `${selected.length} selected` : 'Choose at least one';
+
+  const chips = form.querySelector('#group-chips');
+  if (chips) {
+    chips.hidden = selected.length === 0;
+    chips.innerHTML = selected.map((friend) => `
+      <button class="group-chip" type="button" data-action="remove-group-chip" data-id="${escapeHtml(friend.id)}" aria-label="Remove ${escapeHtml(friend.name)}" title="Remove">
+        ${friendAvatar(friend, 'chip')}<span>${escapeHtml(friend.name)}</span><span class="group-chip-remove" aria-hidden="true">×</span>
+      </button>`).join('');
+  }
+
+  const query = state.groupFriendQuery.trim().toLowerCase();
+  let visible = 0;
+  form.querySelectorAll('.group-friend-row').forEach((row) => {
+    const matches = !query || row.dataset.search.includes(query);
+    row.hidden = !matches;
+    if (matches) visible += 1;
+  });
+  const noMatch = form.querySelector('#group-no-match');
+  if (noMatch) noMatch.hidden = visible > 0;
+
+  const submit = form.querySelector('#create-group-submit');
+  if (submit && !submit.dataset.busy) {
+    submit.disabled = !name || selected.length === 0;
+    submit.textContent = selected.length ? `Create group (${selected.length + 1} people)` : 'Create group';
+  }
+}
+
 function closeModal() {
   const modalRoot = document.querySelector('#modal-root');
   if (modalRoot) modalRoot.replaceChildren();
@@ -1058,6 +1249,11 @@ function renderCallOverlay() {
   if (!call) {
     overlay.innerHTML = '';
     overlay.hidden = true;
+    return;
+  }
+
+  if (call.kind === 'group') {
+    renderGroupCallOverlay(overlay, call);
     return;
   }
 
@@ -1100,6 +1296,74 @@ function renderCallOverlay() {
     remoteAudio.muted = false;
     remoteAudio.volume = 1;
     playRemoteMedia(remoteAudio);
+  }
+}
+
+function renderGroupCallOverlay(overlay, call) {
+  const incoming = call.direction === 'incoming' && call.phase === 'ringing';
+  const video = call.mediaType === 'video';
+  const peers = [...state.groupPeers.values()];
+  const title = incoming ? 'Incoming group call' : call.phase === 'joining' ? 'Joining call…' : 'Group call';
+  const status = incoming
+    ? `${call.callerName} is calling`
+    : call.phase === 'joining'
+      ? 'Connecting…'
+      : peers.length ? `${peers.length + 1} in call` : 'Ringing members…';
+
+  const tile = (user, label, detail, mediaAttribute) => `
+    <div class="group-call-tile">
+      ${mediaAttribute ? `<video ${mediaAttribute} autoplay muted playsinline></video>` : ''}
+      <div class="group-call-tile-avatar">${avatarMarkup(user, 'lg')}</div>
+      <div class="group-call-tile-label"><strong>${escapeHtml(label)}</strong>${detail ? `<span>${escapeHtml(detail)}</span>` : ''}</div>
+    </div>`;
+
+  overlay.hidden = false;
+  overlay.innerHTML = `
+    <section class="call-card group-call-card" role="dialog" aria-modal="true" aria-labelledby="call-title">
+      <header class="call-card-header">
+        <div>
+          <h2 id="call-title">${escapeHtml(title)}</h2>
+          <p>${escapeHtml(call.groupName)} · ${video ? 'Video call' : 'Voice call'}</p>
+        </div>
+        <span class="call-status">${escapeHtml(status)}</span>
+      </header>
+      ${incoming
+        ? `<div class="call-avatar group-call-ringing" aria-hidden="true">${escapeHtml(initials(call.groupName))}</div>`
+        : `<div class="group-call-grid" data-count="${peers.length + 1}">
+            ${tile(state.user, 'You', call.muted ? 'Muted' : '', video && call.cameraEnabled ? 'data-local-video' : '')}
+            ${peers.map((peer) => tile(
+              userForProfile(peer.userId) || { id: peer.userId, name: peer.name },
+              peer.name,
+              peer.status,
+              video && peer.stream?.getVideoTracks().length ? `data-peer-video="${escapeHtml(peer.userId)}"` : '',
+            )).join('')}
+          </div>
+          ${peers.map((peer) => `<audio data-peer-audio="${escapeHtml(peer.userId)}" autoplay hidden></audio>`).join('')}`}
+      <footer class="call-controls">
+        ${incoming
+          ? `<button class="call-control accept" data-call-action="accept">Join</button><button class="call-control hangup" data-call-action="reject">Decline</button>`
+          : `<button class="call-control" data-call-action="mute">${call.muted ? 'Unmute' : 'Mute'}</button>
+             ${video ? `<button class="call-control" data-call-action="camera">${call.cameraEnabled ? 'Turn camera off' : 'Turn camera on'}</button>` : ''}
+             <button class="call-control hangup" data-call-action="hangup">Leave</button>`}
+      </footer>
+    </section>`;
+
+  const localVideo = overlay.querySelector('[data-local-video]');
+  if (localVideo && state.localStream) localVideo.srcObject = state.localStream;
+  for (const peer of peers) {
+    if (!peer.stream) continue;
+    const peerVideo = overlay.querySelector(`[data-peer-video="${CSS.escape(String(peer.userId))}"]`);
+    if (peerVideo) {
+      peerVideo.srcObject = peer.stream;
+      playRemoteMedia(peerVideo);
+    }
+    const peerAudio = overlay.querySelector(`[data-peer-audio="${CSS.escape(String(peer.userId))}"]`);
+    if (peerAudio) {
+      peerAudio.srcObject = peer.stream;
+      peerAudio.muted = false;
+      peerAudio.volume = 1;
+      playRemoteMedia(peerAudio);
+    }
   }
 }
 
@@ -1157,14 +1421,18 @@ function renderMessages() {
     const imageMarkup = !isDeleted && imagePreview
       ? `<button class="message-image-button" type="button" data-action="preview-image" data-image-url="${escapeHtml(imagePreview)}" data-image-name="${escapeHtml(message.attachment.name)}" aria-label="View ${escapeHtml(message.attachment.name)} full size"><img class="message-image" src="${escapeHtml(imagePreview)}" alt="${escapeHtml(message.attachment.name)}" loading="lazy" decoding="async"></button>`
       : '';
-    const attachmentMarkup = !isDeleted && message.attachment
+    const isVoice = message.type === 'voice' && Boolean(message.attachment);
+    const voiceMarkup = !isDeleted && isVoice ? voiceMessageMarkup(message) : '';
+    const isProtected = message.type === 'protected' && Boolean(message.protected);
+    const protectedMarkup = !isDeleted && isProtected ? protectedMessageMarkup(message) : '';
+    const attachmentMarkup = !isDeleted && message.attachment && !isVoice
       ? `<button class="attachment-download" type="button" data-action="download-attachment" data-message-id="${escapeHtml(message.id)}">${escapeHtml(message.attachment.name)} · ${formatFileSize(message.attachment.size)} · Download</button>`
       : '';
     const imageWithCaption = message.attachment && CACHED_IMAGE_TYPES.has(message.attachment.mime);
     const inlineTextFooter = !isDeleted && Boolean(message.body) && !message.attachment;
     const messageFooter = `<div class="message-foot"><span>${formattedTime(message.created_at)}${receipt ? ` ${receipt}` : ''}</span></div>`;
     const replyPreview = message.reply_to
-      ? `<div class="message-quote"><strong>${escapeHtml(message.reply_to.sender?.name || 'Message')}</strong><span>${escapeHtml(message.reply_to.unavailable ? 'Original message unavailable' : message.reply_to.deleted_for_everyone_at ? 'This message was deleted' : message.reply_to.body || message.reply_to.attachment?.name || 'Attachment')}</span></div>`
+      ? `<div class="message-quote"><strong>${escapeHtml(message.reply_to.sender?.name || 'Message')}</strong><span>${escapeHtml(messageSummary(message.reply_to))}</span></div>`
       : '';
     const forwardedLabel = message.is_forwarded ? '<div class="message-forwarded">↗ Forwarded</div>' : '';
     return `${divider}
@@ -1174,6 +1442,8 @@ function renderMessages() {
           ${forwardedLabel}
           ${replyPreview}
           ${isDeleted ? '<div class="message-deleted">This message was deleted</div>' : ''}
+          ${voiceMarkup}
+          ${protectedMarkup}
           ${inlineTextFooter
             ? `<div class="message-content">${bodyMarkup}${messageFooter}</div>`
             : imageWithCaption ? `${imageMarkup}${bodyMarkup}${attachmentMarkup}` : `${bodyMarkup}${imageMarkup}${attachmentMarkup}`}
@@ -1182,7 +1452,7 @@ function renderMessages() {
             <div class="message-menu-items" role="menu" aria-label="Message options">
               <button type="button" role="menuitem" data-action="reply-message" data-message-id="${escapeHtml(message.id)}">↩ <span>Reply</span></button>
               <button type="button" role="menuitem" data-action="forward-message" data-message-id="${escapeHtml(message.id)}">↗ <span>Forward</span></button>
-              <button type="button" role="menuitem" data-action="copy-message" data-message-id="${escapeHtml(message.id)}">⧉ <span>Copy message</span></button>
+              ${isVoice || (isProtected && !state.unlockedMessages.has(String(message.id))) ? '' : `<button type="button" role="menuitem" data-action="copy-message" data-message-id="${escapeHtml(message.id)}">⧉ <span>Copy message</span></button>`}
               <button type="button" role="menuitem" data-action="delete-message-for-me" data-message-id="${escapeHtml(message.id)}">⌫ <span>Delete for me</span></button>
               ${isMine ? `<button type="button" role="menuitem" data-action="delete-message-for-everyone" data-message-id="${escapeHtml(message.id)}">× <span>Delete for everyone</span></button>` : ''}
             </div>
@@ -1191,7 +1461,493 @@ function renderMessages() {
         </div>
       </div>`;
   }).join('');
+  updateVoiceViews();
   if (wasNearBottom) list.scrollTop = list.scrollHeight;
+}
+
+// ---------------------------------------------------------------------------
+// Voice messages
+//
+// The message list is rebuilt on every update, so playback lives in a single
+// shared Audio element (state.voicePlayer) and the bubbles only mirror it.
+// ---------------------------------------------------------------------------
+
+function voiceKey(conversationId, messageId) {
+  return attachmentCacheKey(conversationId, messageId);
+}
+
+function voiceMessageMarkup(message) {
+  const key = voiceKey(message.conversation_id, message.id);
+  const label = `Voice message, ${formatCallDuration(message.voice?.duration_seconds)}`;
+  return `<div class="voice-message" data-voice-key="${escapeHtml(key)}">
+      <button class="voice-play" type="button" data-action="toggle-voice" data-message-id="${escapeHtml(message.id)}" aria-label="Play ${escapeHtml(label)}" title="Play">▶</button>
+      <div class="voice-track" data-action="seek-voice" data-message-id="${escapeHtml(message.id)}" role="slider" aria-label="Playback position" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="-1"><div class="voice-progress"></div></div>
+      <span class="voice-time">${escapeHtml(formatCallDuration(message.voice?.duration_seconds))}</span>
+    </div>`;
+}
+
+function updateVoiceViews() {
+  const player = state.voicePlayer;
+  document.querySelectorAll('.voice-message[data-voice-key]').forEach((element) => {
+    const message = state.messages.find((item) =>
+      voiceKey(item.conversation_id, item.id) === element.dataset.voiceKey);
+    const totalSeconds = Number(message?.voice?.duration_seconds) || 0;
+    const active = player && player.key === element.dataset.voiceKey;
+    const playing = active && player.status === 'playing';
+    const loading = active && player.status === 'loading';
+    const audioDuration = active && Number.isFinite(player.audio.duration) ? player.audio.duration : totalSeconds;
+    const position = active ? player.audio.currentTime : 0;
+    const percent = audioDuration > 0 ? Math.min(100, (position / audioDuration) * 100) : 0;
+
+    const button = element.querySelector('.voice-play');
+    button.textContent = loading ? '…' : playing ? '❚❚' : '▶';
+    button.title = playing ? 'Pause' : 'Play';
+    button.setAttribute('aria-label', `${playing ? 'Pause' : 'Play'} voice message`);
+    element.classList.toggle('playing', Boolean(playing));
+    element.querySelector('.voice-progress').style.width = `${percent}%`;
+    element.querySelector('.voice-track').setAttribute('aria-valuenow', String(Math.round(percent)));
+    element.querySelector('.voice-time').textContent = formatCallDuration(
+      active && position > 0 ? position : totalSeconds,
+    );
+  });
+}
+
+function stopVoicePlayback() {
+  const player = state.voicePlayer;
+  if (!player) return;
+  state.voicePlayer = null;
+  player.audio.pause();
+  player.audio.removeAttribute('src');
+  updateVoiceViews();
+}
+
+function releaseVoiceBlobs() {
+  stopVoicePlayback();
+  for (const url of state.voiceBlobUrls.values()) URL.revokeObjectURL(url);
+  state.voiceBlobUrls.clear();
+}
+
+async function toggleVoicePlayback(messageId) {
+  const message = state.messages.find((item) => String(item.id) === String(messageId));
+  if (!message || message.type !== 'voice' || !message.attachment) {
+    throw new Error('This voice message is no longer available.');
+  }
+  const key = voiceKey(message.conversation_id, message.id);
+  const current = state.voicePlayer;
+  if (current?.key === key) {
+    if (current.status === 'loading') return;
+    if (current.audio.paused) await current.audio.play();
+    else current.audio.pause();
+    return;
+  }
+
+  stopVoicePlayback();
+  const audio = new Audio();
+  const player = { key, audio, status: 'loading' };
+  state.voicePlayer = player;
+  updateVoiceViews();
+
+  try {
+    let url = state.voiceBlobUrls.get(key);
+    if (!url) {
+      const blob = await fetchAttachmentBlob(message.conversation_id, message.id);
+      if (!blob.type.startsWith('audio/')) throw new Error('The voice message could not be verified.');
+      url = URL.createObjectURL(blob);
+      state.voiceBlobUrls.set(key, url);
+    }
+    if (state.voicePlayer !== player) return;
+
+    const sync = (status) => () => {
+      if (state.voicePlayer !== player) return;
+      if (status) player.status = status;
+      updateVoiceViews();
+    };
+    audio.addEventListener('playing', sync('playing'));
+    audio.addEventListener('pause', sync('paused'));
+    audio.addEventListener('timeupdate', sync());
+    audio.addEventListener('ended', () => {
+      if (state.voicePlayer !== player) return;
+      stopVoicePlayback();
+    });
+    audio.src = url;
+    await audio.play();
+  } catch (error) {
+    if (state.voicePlayer === player) stopVoicePlayback();
+    throw new Error(`The voice message could not be played: ${error.message}`);
+  }
+}
+
+function seekVoice(track, clientX) {
+  const player = state.voicePlayer;
+  const element = track.closest('.voice-message');
+  if (!player || element?.dataset.voiceKey !== player.key || player.status === 'loading') return;
+  const duration = Number.isFinite(player.audio.duration)
+    ? player.audio.duration
+    : Number(state.messages.find((item) =>
+      voiceKey(item.conversation_id, item.id) === player.key)?.voice?.duration_seconds) || 0;
+  if (!duration) return;
+  const bounds = track.getBoundingClientRect();
+  const fraction = Math.min(1, Math.max(0, (clientX - bounds.left) / bounds.width));
+  player.audio.currentTime = fraction * duration;
+  updateVoiceViews();
+}
+
+function renderVoiceRecorder() {
+  const recorder = document.querySelector('#voice-recorder');
+  const form = document.querySelector('#message-form');
+  if (!recorder || !form) return;
+  const recording = state.voiceRecording;
+  const visible = Boolean(recording &&
+    String(recording.conversationId) === String(state.selectedConversationId));
+  recorder.hidden = !visible;
+  form.hidden = visible;
+  if (!visible) {
+    recorder.replaceChildren();
+    return;
+  }
+  recorder.innerHTML = `
+    <button class="voice-recorder-cancel" type="button" data-action="cancel-voice-recording" aria-label="Discard recording" title="Discard recording"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg></button>
+    <span class="voice-recorder-dot" aria-hidden="true"></span>
+    <span class="voice-recorder-time" id="voice-recorder-time" aria-live="off">0:00</span>
+    <span class="voice-recorder-hint">Recording… up to ${formatCallDuration(MAX_VOICE_SECONDS)}</span>
+    <button class="send-button" type="button" data-action="send-voice-recording" aria-label="Send voice message" title="Send voice message">➤</button>`;
+  updateVoiceRecorderTime();
+}
+
+function updateVoiceRecorderTime() {
+  const recording = state.voiceRecording;
+  const label = document.querySelector('#voice-recorder-time');
+  if (!recording || !label) return;
+  label.textContent = formatCallDuration((Date.now() - recording.startedAt) / 1000);
+}
+
+async function startVoiceRecording() {
+  const conversation = selectedConversation();
+  if (!conversation || state.voiceRecording) return;
+  if (state.call) throw new Error('Voice messages cannot be recorded during a call.');
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+    throw new Error('Voice recording is not supported on this device.');
+  }
+  const mimeType = VOICE_MIME_TYPES.find((type) => MediaRecorder.isTypeSupported(type));
+  if (!mimeType) throw new Error('This device cannot record audio in a supported format.');
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (error) {
+    throw new Error(`Could not access your microphone: ${error.message}`);
+  }
+  if (String(state.selectedConversationId) !== String(conversation.id) || state.voiceRecording || state.call) {
+    stream.getTracks().forEach((track) => track.stop());
+    return;
+  }
+
+  stopVoicePlayback();
+  stopLocalTyping();
+  const recorder = new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 32000 });
+  const recording = {
+    recorder,
+    stream,
+    mimeType,
+    chunks: [],
+    conversationId: conversation.id,
+    startedAt: Date.now(),
+    timer: null,
+    stopped: new Promise((resolve) => recorder.addEventListener('stop', resolve, { once: true })),
+  };
+  recorder.addEventListener('dataavailable', (event) => {
+    if (event.data?.size) recording.chunks.push(event.data);
+  });
+  recorder.start(1000);
+  recording.timer = setInterval(() => {
+    updateVoiceRecorderTime();
+    if (Date.now() - recording.startedAt >= MAX_VOICE_SECONDS * 1000) {
+      void finishVoiceRecording(true).catch((error) => showNotice(error.message));
+    }
+  }, 250);
+  state.voiceRecording = recording;
+  renderVoiceRecorder();
+}
+
+async function stopRecorder(recording) {
+  clearInterval(recording.timer);
+  if (recording.recorder.state !== 'inactive') recording.recorder.stop();
+  await recording.stopped;
+  recording.stream.getTracks().forEach((track) => track.stop());
+}
+
+function cancelVoiceRecording() {
+  const recording = state.voiceRecording;
+  if (!recording) return;
+  state.voiceRecording = null;
+  renderVoiceRecorder();
+  void stopRecorder(recording);
+}
+
+async function finishVoiceRecording(send) {
+  const recording = state.voiceRecording;
+  if (!recording) return;
+  state.voiceRecording = null;
+  const elapsed = Date.now() - recording.startedAt;
+  renderVoiceRecorder();
+  await stopRecorder(recording);
+  if (!send) return;
+  if (elapsed < MIN_VOICE_MILLISECONDS) {
+    showNotice('Hold on a little longer — voice messages must be at least 1 second.');
+    return;
+  }
+
+  const baseType = recording.mimeType.split(';')[0];
+  const blob = new Blob(recording.chunks, { type: baseType });
+  if (!blob.size) throw new Error('No audio was captured. Check your microphone and try again.');
+  if (blob.size > MAX_ATTACHMENT_SIZE) throw new Error('The voice message is too large to send.');
+
+  const conversationId = recording.conversationId;
+  const replyTarget = String(state.selectedConversationId) === String(conversationId) ? state.replyTarget : null;
+  const extension = baseType === 'audio/ogg' ? 'ogg' : 'webm';
+  const payload = new FormData();
+  payload.append('voice', new File([blob], `voice-message.${extension}`, { type: baseType }));
+  payload.append('voice_duration_seconds', String(Math.min(MAX_VOICE_SECONDS, Math.max(1, Math.round(elapsed / 1000)))));
+  if (replyTarget) payload.append('reply_to_message_id', replyTarget.id);
+
+  const sentMessage = await api(`/conversations/${encodeURIComponent(conversationId)}/messages`, {
+    method: 'POST',
+    body: payload,
+  });
+  state.voiceBlobUrls.set(voiceKey(conversationId, sentMessage.id), URL.createObjectURL(blob));
+  await notifyMessageSent(conversationId, sentMessage.id);
+  if (replyTarget && state.replyTarget === replyTarget) {
+    state.replyTarget = null;
+    updateReplyPreview();
+  }
+  await refreshData();
+  const messageList = document.querySelector('#message-list');
+  if (messageList && String(state.selectedConversationId) === String(conversationId)) {
+    messageList.scrollTop = messageList.scrollHeight;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Protected messages
+//
+// The text is encrypted here with AES-256-GCM under a key derived (PBKDF2) from
+// a random one-time password. Only the encrypted envelope is sent; the password
+// is shown once to the sender, who passes it on in person.
+// ---------------------------------------------------------------------------
+
+function generateProtectedPassword() {
+  const limit = 256 - (256 % PROTECTED_ALPHABET.length);
+  const characters = [];
+  while (characters.length < PROTECTED_PASSWORD_LENGTH) {
+    for (const byte of crypto.getRandomValues(new Uint8Array(32))) {
+      if (byte < limit && characters.length < PROTECTED_PASSWORD_LENGTH) {
+        characters.push(PROTECTED_ALPHABET[byte % PROTECTED_ALPHABET.length]);
+      }
+    }
+  }
+  return characters.join('').match(/.{4}/g).join('-');
+}
+
+// Passwords are typed by hand, so spacing, dashes, and letter case are ignored.
+function normalizeProtectedPassword(value) {
+  return String(value ?? '').replace(/[\s-]/g, '').toUpperCase();
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function base64ToBytes(value) {
+  return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+}
+
+async function deriveProtectedKey(password, salt, iterations, usage) {
+  const material = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(normalizeProtectedPassword(password)),
+    'PBKDF2',
+    false,
+    ['deriveKey'],
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations },
+    material,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    [usage],
+  );
+}
+
+async function encryptProtectedMessage(plaintext) {
+  const password = generateProtectedPassword();
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveProtectedKey(password, salt, PROTECTED_KDF_ITERATIONS, 'encrypt');
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(plaintext));
+  return {
+    password,
+    // Key order matters: the API checks the envelope's exact shape.
+    envelope: {
+      v: 1,
+      alg: 'AES-256-GCM',
+      kdf: 'PBKDF2-SHA256',
+      iter: PROTECTED_KDF_ITERATIONS,
+      salt: bytesToBase64(salt),
+      iv: bytesToBase64(iv),
+      ct: bytesToBase64(new Uint8Array(ciphertext)),
+    },
+  };
+}
+
+async function decryptProtectedMessage(envelope, password) {
+  if (envelope?.v !== 1 || envelope.alg !== 'AES-256-GCM' || envelope.kdf !== 'PBKDF2-SHA256' ||
+    !Number.isInteger(envelope.iter)) {
+    throw new Error('This protected message uses a format this app cannot open.');
+  }
+  const key = await deriveProtectedKey(password, base64ToBytes(envelope.salt), envelope.iter, 'decrypt');
+  try {
+    const plaintext = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: base64ToBytes(envelope.iv) },
+      key,
+      base64ToBytes(envelope.ct),
+    );
+    return new TextDecoder().decode(plaintext);
+  } catch {
+    throw new Error('Incorrect password. Check it and try again.');
+  }
+}
+
+function protectedMessageMarkup(message) {
+  const unlocked = state.unlockedMessages.get(String(message.id));
+  if (unlocked !== undefined) {
+    return `<div class="protected-message unlocked">
+        <div class="protected-header"><span>🔓 Protected message</span><button class="text-button" type="button" data-action="lock-protected" data-message-id="${escapeHtml(message.id)}">Hide</button></div>
+        <div class="message-text">${linkifyMessageText(unlocked)}</div>
+      </div>`;
+  }
+  return `<div class="protected-message">
+      <span class="protected-icon" aria-hidden="true">🔒</span>
+      <span class="protected-text"><strong>Protected message</strong><span>Enter the password to view it.</span></span>
+      <button class="small-button" type="button" data-action="unlock-protected" data-message-id="${escapeHtml(message.id)}">Unlock</button>
+    </div>`;
+}
+
+function renderProtectedComposeModal() {
+  const modalRoot = document.querySelector('#modal-root');
+  const conversation = selectedConversation();
+  if (!modalRoot || !conversation) return;
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <form class="app-modal protected-modal" id="protected-message-form" role="dialog" aria-modal="true" aria-labelledby="protected-modal-title" data-conversation-id="${escapeHtml(conversation.id)}">
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Close">×</button>
+        <h2 id="protected-modal-title">Send a protected message</h2>
+        <p class="modal-subtitle">To ${escapeHtml(conversationTitle(conversation))}. The text is encrypted on this computer and a one-time password is generated. Only someone with the password can read it.</p>
+        <textarea class="protected-input" name="secret" rows="6" maxlength="${MAX_PROTECTED_LENGTH}" placeholder="For example: login details, account numbers…" aria-label="Protected message text" required spellcheck="false" autocomplete="off"></textarea>
+        <footer class="forward-modal-actions">
+          <span class="forward-selection-count">Up to ${MAX_PROTECTED_LENGTH} characters</span>
+          <button class="primary-button" type="submit">Encrypt and send</button>
+        </footer>
+      </form>
+    </div>`;
+  modalRoot.querySelector('textarea')?.focus();
+}
+
+function renderProtectedPasswordModal(password, conversationName) {
+  const modalRoot = document.querySelector('#modal-root');
+  if (!modalRoot) return;
+  // Sticky: a stray click or Escape must not dismiss the only copy of the password.
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop data-sticky>
+      <section class="app-modal protected-modal" role="dialog" aria-modal="true" aria-labelledby="protected-password-title">
+        <h2 id="protected-password-title">Protected message sent</h2>
+        <p class="modal-subtitle">Give this password to ${escapeHtml(conversationName)} in person. It is not stored anywhere and will not be shown again. Without it, the message cannot be opened.</p>
+        <div class="protected-password" id="protected-password">${escapeHtml(password)}</div>
+        <footer class="forward-modal-actions">
+          <button class="small-button" type="button" data-action="copy-protected-password" data-password="${escapeHtml(password)}">Copy password</button>
+          <button class="primary-button" type="button" data-action="close-modal">Done</button>
+        </footer>
+      </section>
+    </div>`;
+}
+
+function renderUnlockModal(message) {
+  const modalRoot = document.querySelector('#modal-root');
+  if (!modalRoot) return;
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <form class="app-modal protected-modal" id="unlock-protected-form" role="dialog" aria-modal="true" aria-labelledby="unlock-modal-title" data-message-id="${escapeHtml(message.id)}">
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Close">×</button>
+        <h2 id="unlock-modal-title">Unlock protected message</h2>
+        <p class="modal-subtitle">From ${escapeHtml(message.sender?.name || 'a contact')}. Enter the password they gave you. Dashes, spaces, and letter case do not matter.</p>
+        <input class="protected-password-input" name="password" type="text" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX" aria-label="Password" required spellcheck="false" autocomplete="off">
+        <p class="protected-error" id="unlock-error" role="alert" hidden></p>
+        <footer class="forward-modal-actions">
+          <span></span>
+          <button class="primary-button" type="submit">Unlock</button>
+        </footer>
+      </form>
+    </div>`;
+  modalRoot.querySelector('input')?.focus();
+}
+
+async function handleSendProtected(form) {
+  const plaintext = form.elements.secret.value;
+  if (!plaintext.trim()) throw new Error('Enter the text you want to protect.');
+  if (plaintext.length > MAX_PROTECTED_LENGTH) {
+    throw new Error(`Protected messages can be up to ${MAX_PROTECTED_LENGTH} characters.`);
+  }
+  const conversationId = form.dataset.conversationId;
+  const conversation = state.conversations.find((item) => String(item.id) === String(conversationId));
+  if (!conversation) throw new Error('This conversation is no longer available.');
+
+  const submitButton = form.querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  submitButton.textContent = 'Encrypting…';
+  try {
+    const { password, envelope } = await encryptProtectedMessage(plaintext);
+    const sentMessage = await api(`/conversations/${encodeURIComponent(conversationId)}/messages`, {
+      method: 'POST',
+      body: { type: 'protected', body: JSON.stringify(envelope) },
+    });
+    form.elements.secret.value = '';
+    renderProtectedPasswordModal(password, conversationTitle(conversation));
+    await notifyMessageSent(conversationId, sentMessage.id);
+    await refreshData();
+  } finally {
+    if (submitButton.isConnected) {
+      submitButton.disabled = false;
+      submitButton.textContent = 'Encrypt and send';
+    }
+  }
+}
+
+async function handleUnlockProtected(form) {
+  const message = state.messages.find((item) => String(item.id) === String(form.dataset.messageId));
+  if (!message?.protected) throw new Error('This message is no longer available.');
+  const error = form.querySelector('#unlock-error');
+  const submitButton = form.querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  submitButton.textContent = 'Unlocking…';
+  error.hidden = true;
+  try {
+    const plaintext = await decryptProtectedMessage(message.protected, form.elements.password.value);
+    state.unlockedMessages.set(String(message.id), plaintext);
+    closeModal();
+    renderMessages();
+  } catch (unlockError) {
+    error.textContent = unlockError.message;
+    error.hidden = false;
+    form.elements.password.select();
+  } finally {
+    if (submitButton.isConnected) {
+      submitButton.disabled = false;
+      submitButton.textContent = 'Unlock';
+    }
+  }
 }
 
 function updateReplyPreview() {
@@ -1202,7 +1958,7 @@ function updateReplyPreview() {
   preview.innerHTML = message ? `
     <div class="reply-preview-content">
       <strong>Replying to ${escapeHtml(message.sender?.name || 'message')}</strong>
-      <span>${escapeHtml(message.deleted_for_everyone_at ? 'This message was deleted' : message.body || message.attachment?.name || 'Attachment')}</span>
+      <span>${escapeHtml(messageSummary(message))}</span>
     </div>
     <button class="reply-preview-cancel" type="button" data-action="cancel-reply" aria-label="Cancel reply">×</button>` : '';
 }
@@ -1249,8 +2005,10 @@ function syncUnreadIndicators() {
     const count = Number(conversation.unread_count);
     return total + (Number.isSafeInteger(count) && count > 0 ? count : 0);
   }, 0);
-  const shouldNotify = state.unreadCount !== null && unreadCount > state.unreadCount;
+  const shouldNotify = state.settings.notifications &&
+    state.unreadCount !== null && unreadCount > state.unreadCount;
   state.unreadCount = unreadCount;
+  notifyNewMessages();
 
   const unreadLabel = document.querySelector('#unread-message-count');
   if (unreadLabel) {
@@ -1259,6 +2017,37 @@ function syncUnreadIndicators() {
   }
   document.title = unreadCount ? `(${unreadCount}) PITBConnect — Messages` : 'PITBConnect — Messages';
   window.desktopApp?.setUnreadCount(unreadCount, shouldNotify);
+}
+
+// Shows a desktop notification for each conversation whose unread count grew
+// since the last sync. The first sync after sign-in only records the counts.
+function notifyNewMessages() {
+  const previous = state.unreadByConversation;
+  state.unreadByConversation = new Map(state.conversations.map((conversation) =>
+    [String(conversation.id), Number(conversation.unread_count) || 0]));
+  if (!previous || !state.settings.notifications || document.hasFocus()) return;
+
+  const grown = state.conversations.filter((conversation) => {
+    const message = conversation.last_message;
+    return (Number(conversation.unread_count) || 0) > (previous.get(String(conversation.id)) || 0) &&
+      message && String(message.sender?.id) !== String(state.user?.id);
+  });
+  for (const conversation of grown.slice(0, 3)) {
+    const message = conversation.last_message;
+    const content = state.settings.blurMessages ? 'New message' : messagePreview(message, 'New message');
+    window.desktopApp?.showNotification({
+      title: conversationTitle(conversation),
+      body: conversation.type === 'group' && message.sender?.name ? `${message.sender.name}: ${content}` : content,
+      conversationId: Number(conversation.id),
+    });
+  }
+}
+
+async function openConversationById(conversationId) {
+  const conversation = state.conversations.find((item) => String(item.id) === String(conversationId));
+  if (!conversation) return;
+  if (conversation.type === 'group') await openGroupConversation(conversation.id);
+  else if (conversation.friend?.id) await openFriend(conversation.friend.id);
 }
 
 function formatFileSize(size) {
@@ -1423,6 +2212,11 @@ function updateCall(patch) {
 function cleanupCall() {
   state.peerConnection?.close();
   state.peerConnection = null;
+  for (const peer of state.groupPeers.values()) {
+    peer.pc.close();
+    peer.stream?.getTracks().forEach((track) => track.stop());
+  }
+  state.groupPeers.clear();
   for (const stream of [state.localStream, state.remoteStream]) {
     stream?.getTracks().forEach((track) => track.stop());
   }
@@ -1496,16 +2290,17 @@ async function startCall(mediaType) {
     showNotice('Wait for the realtime chat connection before starting a call.');
     return;
   }
-  if (conversation.type === 'group') {
-    showNotice('Voice and video calls are not available in group chats.');
-    return;
-  }
   if (state.call) {
     showNotice('Finish the current call before starting another.');
     return;
   }
   if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === 'undefined') {
     showNotice('Audio and video calls are not supported by this device.');
+    return;
+  }
+  if (state.voiceRecording) cancelVoiceRecording();
+  if (conversation.type === 'group') {
+    await startGroupCall(conversation, mediaType);
     return;
   }
 
@@ -1655,8 +2450,284 @@ async function handleCallSignal(call, signal) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Group calls (mesh): one RTCPeerConnection per other participant. Whoever
+// joins sends offers to everyone already in the call; existing participants
+// only answer, so two peers never offer to each other at the same time.
+// ---------------------------------------------------------------------------
+
+function groupConversationById(conversationId) {
+  return state.conversations.find((item) =>
+    String(item.id) === String(conversationId) && item.type === 'group') || null;
+}
+
+function groupMemberName(conversationId, userId) {
+  return groupConversationById(conversationId)?.participants
+    ?.find((member) => String(member.id) === String(userId))?.name || 'Member';
+}
+
+async function acquireCallMedia(mediaType) {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    video: mediaType === 'video',
+  });
+  if (!stream.getAudioTracks().some((track) => track.enabled && track.readyState === 'live')) {
+    stream.getTracks().forEach((track) => track.stop());
+    throw new Error('No active microphone audio track was created. Check microphone permissions and input settings.');
+  }
+  return stream;
+}
+
+async function startGroupCall(conversation, mediaType) {
+  const call = {
+    id: crypto.randomUUID(),
+    kind: 'group',
+    conversationId: Number(conversation.id),
+    groupName: conversation.name || 'Group',
+    callerName: state.user?.name || 'You',
+    mediaType,
+    direction: 'outgoing',
+    phase: 'joining',
+    muted: false,
+    cameraEnabled: true,
+    playbackWarningShown: false,
+    connectionStatus: '',
+  };
+  state.call = call;
+  state.recentGroupCallIds.add(call.id);
+  renderCallOverlay();
+
+  let stream;
+  try {
+    stream = await acquireCallMedia(mediaType);
+  } catch (error) {
+    stopCall(`Could not access your microphone or camera: ${error.message}`);
+    return;
+  }
+  if (state.call?.id !== call.id) {
+    stream.getTracks().forEach((track) => track.stop());
+    return;
+  }
+  state.localStream = stream;
+  renderCallOverlay();
+  await sendCallEvent('group-call:start', {
+    call_id: call.id,
+    conversation_id: call.conversationId,
+    media_type: mediaType,
+  });
+}
+
+async function answerGroupCall() {
+  const call = state.call;
+  if (call?.kind !== 'group' || call.phase !== 'ringing' || !state.socketConnected) return;
+  if (state.voiceRecording) cancelVoiceRecording();
+  updateCall({ phase: 'joining' });
+
+  let stream;
+  try {
+    stream = await acquireCallMedia(call.mediaType);
+  } catch (error) {
+    void sendCallEvent('group-call:decline', { call_id: call.id });
+    stopCall(`Could not access your microphone or camera: ${error.message}`);
+    return;
+  }
+  if (state.call?.id !== call.id) {
+    stream.getTracks().forEach((track) => track.stop());
+    return;
+  }
+  state.localStream = stream;
+  renderCallOverlay();
+  await sendCallEvent('group-call:join', { call_id: call.id });
+}
+
+function sendGroupSignal(callId, userId, signal) {
+  return sendCallEvent('group-call:signal', { call_id: callId, to_user_id: Number(userId), signal });
+}
+
+function createGroupPeer(userId, name, initiator) {
+  const key = String(userId);
+  const existing = state.groupPeers.get(key);
+  if (existing) return existing;
+
+  const callId = state.call.id;
+  const pc = new RTCPeerConnection({ iceServers: state.iceServers });
+  const peer = {
+    userId: Number(userId),
+    name: name || groupMemberName(state.call.conversationId, userId),
+    pc,
+    stream: null,
+    pendingCandidates: [],
+    status: 'Connecting…',
+    queue: Promise.resolve(),
+  };
+  state.groupPeers.set(key, peer);
+  state.localStream?.getTracks().forEach((track) => pc.addTrack(track, state.localStream));
+
+  const isCurrent = () => state.call?.id === callId && state.groupPeers.get(key) === peer;
+  pc.onicecandidate = ({ candidate }) => {
+    if (candidate && isCurrent()) void sendGroupSignal(callId, userId, { candidate: candidate.toJSON() });
+  };
+  pc.ontrack = ({ streams, track }) => {
+    if (!isCurrent()) return;
+    if (streams[0]) {
+      peer.stream = streams[0];
+    } else {
+      peer.stream ||= new MediaStream();
+      if (!peer.stream.getTracks().some((item) => item.id === track.id)) peer.stream.addTrack(track);
+    }
+    renderCallOverlay();
+  };
+  pc.onconnectionstatechange = () => {
+    if (!isCurrent()) return;
+    peer.status = {
+      connected: '',
+      disconnected: 'Reconnecting…',
+      failed: 'Could not connect',
+    }[pc.connectionState] ?? 'Connecting…';
+    renderCallOverlay();
+  };
+
+  if (initiator) {
+    peer.queue = peer.queue.then(async () => {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      if (isCurrent()) await sendGroupSignal(callId, userId, { description: pc.localDescription.toJSON() });
+    }).catch((error) => {
+      peer.status = 'Could not connect';
+      renderCallOverlay();
+      console.error('Group call offer failed:', error);
+    });
+  }
+  renderCallOverlay();
+  return peer;
+}
+
+function closeGroupPeer(userId) {
+  const key = String(userId);
+  const peer = state.groupPeers.get(key);
+  if (!peer) return;
+  state.groupPeers.delete(key);
+  peer.pc.close();
+  peer.stream?.getTracks().forEach((track) => track.stop());
+  renderCallOverlay();
+}
+
+function handleGroupSignal(payload) {
+  const call = state.call;
+  const fromUserId = Number(payload?.from_user_id);
+  const signal = payload?.signal;
+  if (call?.kind !== 'group' || call.phase !== 'active' || payload?.call_id !== call.id ||
+    !Number.isSafeInteger(fromUserId) || !signal || typeof signal !== 'object') return;
+
+  const peer = createGroupPeer(fromUserId, null, false);
+  const { pc } = peer;
+  // Signals for one peer are applied strictly in order.
+  peer.queue = peer.queue.then(async () => {
+    if (signal.candidate) {
+      if (!pc.remoteDescription) peer.pendingCandidates.push(signal.candidate);
+      else await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      return;
+    }
+    const description = signal.description;
+    if (!description || !['offer', 'answer'].includes(description.type) ||
+      typeof description.sdp !== 'string') return;
+    await pc.setRemoteDescription(new RTCSessionDescription(description));
+    for (const candidate of peer.pendingCandidates.splice(0)) {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    }
+    if (description.type === 'offer') {
+      await pc.setLocalDescription(await pc.createAnswer());
+      if (state.call?.id === call.id) {
+        await sendGroupSignal(call.id, fromUserId, { description: pc.localDescription.toJSON() });
+      }
+    }
+  }).catch((error) => {
+    peer.status = 'Could not connect';
+    renderCallOverlay();
+    console.error('Group call negotiation failed:', error);
+  });
+}
+
+function handleGroupCallSocketEvent(event, payload) {
+  const call = state.call;
+  const callId = payload?.call_id;
+
+  if (event === 'group-call:invite') {
+    if (call || typeof callId !== 'string') return;
+    const conversation = groupConversationById(payload.conversation_id);
+    state.recentGroupCallIds.add(callId);
+    state.call = {
+      id: callId,
+      kind: 'group',
+      conversationId: Number(payload.conversation_id),
+      groupName: conversation?.name || 'Group',
+      callerName: payload.caller_name || 'A member',
+      mediaType: payload.media_type === 'video' ? 'video' : 'audio',
+      direction: 'incoming',
+      phase: 'ringing',
+      muted: false,
+      cameraEnabled: true,
+      playbackWarningShown: false,
+      connectionStatus: '',
+    };
+    renderCallOverlay();
+    return;
+  }
+
+  if (event === 'group-call:ended') {
+    if (state.recentGroupCallIds.has(callId) || String(payload?.caller_id) === String(state.user?.id)) {
+      state.recentGroupCallIds.delete(callId);
+      void persistCallSummary(payload).catch((error) =>
+        showNotice(`Call history could not be saved: ${error.message}`));
+    }
+    if (call?.id === callId) stopCall(call.phase === 'ringing' ? 'The group call ended.' : 'The group call has ended.');
+    return;
+  }
+
+  if (event === 'group-call:joined') {
+    // The server may place us in a call that was already running in this
+    // group, so adopt its id and media type.
+    if (call?.kind !== 'group' || call.phase !== 'joining' ||
+      String(call.conversationId) !== String(payload?.conversation_id)) {
+      void sendCallEvent('group-call:leave', { call_id: callId });
+      return;
+    }
+    state.recentGroupCallIds.add(callId);
+    const mediaType = payload.media_type === 'video' ? 'video' : 'audio';
+    if (mediaType === 'audio' && state.localStream) {
+      for (const track of state.localStream.getVideoTracks()) {
+        track.stop();
+        state.localStream.removeTrack(track);
+      }
+    }
+    updateCall({ id: callId, mediaType, phase: 'active' });
+    for (const participant of payload.participants || []) {
+      createGroupPeer(participant.user_id, participant.name, true);
+    }
+    return;
+  }
+
+  if (call?.kind !== 'group' || call.id !== callId) return;
+
+  if (event === 'group-call:participant-joined' && call.phase === 'active') {
+    createGroupPeer(payload.user_id, payload.name, false);
+  } else if (event === 'group-call:participant-left') {
+    closeGroupPeer(payload.user_id);
+  } else if (event === 'group-call:signal') {
+    handleGroupSignal(payload);
+  } else if (event === 'group-call:dismissed' && call.phase === 'ringing') {
+    cleanupCall();
+  } else if (event === 'group-call:error') {
+    stopCall(payload.message || 'The group call could not continue.');
+  }
+}
+
 async function answerCall() {
   const call = state.call;
+  if (call?.kind === 'group') {
+    await answerGroupCall();
+    return;
+  }
   if (!call || call.direction !== 'incoming' || !state.socketConnected) return;
   await sendCallEvent('call:accept', { call_id: call.id });
   try {
@@ -1670,13 +2741,18 @@ async function answerCall() {
 function rejectCall() {
   const call = state.call;
   if (!call) return;
-  void sendCallEvent('call:reject', { call_id: call.id });
+  void sendCallEvent(call.kind === 'group' ? 'group-call:decline' : 'call:reject', { call_id: call.id });
   cleanupCall();
 }
 
 function hangUpCall() {
   const call = state.call;
   if (!call) return;
+  if (call.kind === 'group') {
+    void sendCallEvent(call.phase === 'ringing' ? 'group-call:decline' : 'group-call:leave', { call_id: call.id });
+    cleanupCall();
+    return;
+  }
   void sendCallEvent(call.phase === 'ringing' ? 'call:cancel' : 'call:end', { call_id: call.id });
   cleanupCall();
 }
@@ -1758,6 +2834,7 @@ function handleSocketEvent(event, payload) {
     state.socketConnected = true;
     void sendCallEvent('call:ready', {
       enabled: Boolean(navigator.mediaDevices?.getUserMedia && typeof RTCPeerConnection !== 'undefined'),
+      group_calls: true,
     });
     state.activeRoomId = null;
     state.joinedRoomId = null;
@@ -1850,6 +2927,8 @@ function handleSocketEvent(event, payload) {
     }
   } else if (event.startsWith('call:')) {
     void handleCallSocketEvent(event, payload);
+  } else if (event.startsWith('group-call:')) {
+    handleGroupCallSocketEvent(event, payload);
   }
 }
 
@@ -1927,6 +3006,7 @@ async function openFriend(friendId) {
   }
   stopLocalTyping();
   clearTypingIndicator();
+  if (String(state.selectedConversationId) !== String(conversation.id)) cancelVoiceRecording();
   state.sidebarTool = null;
   state.selectedConversationId = conversation.id;
   state.messages = [];
@@ -1950,6 +3030,7 @@ async function openGroupConversation(conversationId) {
   }
   stopLocalTyping();
   clearTypingIndicator();
+  if (String(state.selectedConversationId) !== String(conversation.id)) cancelVoiceRecording();
   state.sidebarTool = null;
   state.selectedConversationId = conversation.id;
   state.messages = [];
@@ -1997,14 +3078,25 @@ async function handleCreateGroup(form) {
   const formData = new FormData(form);
   const name = formData.get('name')?.toString().trim() || '';
   const friendIds = formData.getAll('friend_ids').map((id) => Number(id));
-  if (!name) throw new Error('Enter a group title.');
+  if (!name) throw new Error('Enter a group name.');
   if (!friendIds.length) throw new Error('Choose at least one friend to add to the group.');
-  const conversation = await api('/groups', {
-    method: 'POST',
-    body: { name, friend_ids: friendIds },
-  });
-  state.sidebarTool = null;
+  const submit = form.querySelector('#create-group-submit');
+  submit.dataset.busy = 'true';
+  submit.disabled = true;
+  submit.textContent = 'Creating…';
+  let conversation;
+  try {
+    conversation = await api('/groups', {
+      method: 'POST',
+      body: { name, friend_ids: friendIds },
+    });
+  } finally {
+    delete submit.dataset.busy;
+    updateCreateGroupView();
+  }
+  closeModal();
   state.groupName = '';
+  state.groupFriendQuery = '';
   state.selectedGroupFriendIds.clear();
   state.conversations = sortConversationsByLatest([...state.conversations, conversation]);
   await refreshData();
@@ -2453,6 +3545,8 @@ app.addEventListener('submit', async (event) => {
     if (form.id === 'add-group-member-form') await handleAddGroupMember(form);
     if (form.id === 'message-form') await handleSendMessage(form);
     if (form.id === 'forward-message-form') await handleForwardMessage(form);
+    if (form.id === 'protected-message-form') await handleSendProtected(form);
+    if (form.id === 'unlock-protected-form') await handleUnlockProtected(form);
   } catch (error) {
     showNotice(error.message || 'Something went wrong. Please try again.');
   }
@@ -2462,7 +3556,7 @@ app.addEventListener('click', async (event) => {
   if (!event.target.closest('.message-menu')) {
     document.querySelectorAll('.message-menu[open]').forEach((menu) => menu.removeAttribute('open'));
   }
-  if (event.target.matches('.modal-backdrop')) {
+  if (event.target.matches('.modal-backdrop:not([data-sticky])')) {
     closeModal();
     return;
   }
@@ -2545,6 +3639,41 @@ app.addEventListener('click', async (event) => {
       await loadCallHistory({ append: true });
     } else if (action === 'call-audio' || action === 'call-video') {
       await startCall(action === 'call-video' ? 'video' : 'audio');
+    } else if (action === 'open-create-group') {
+      renderCreateGroupModal();
+    } else if (action === 'remove-group-chip') {
+      state.selectedGroupFriendIds.delete(String(id));
+      const checkbox = document.querySelector(`#create-group-form input[name="friend_ids"][value="${CSS.escape(String(id))}"]`);
+      if (checkbox) checkbox.checked = false;
+      updateCreateGroupView();
+    } else if (action === 'open-add-friend-from-group') {
+      closeModal();
+      state.sidebarTool = 'add';
+      renderSidebar();
+      document.querySelector('#friend-phone')?.focus();
+    } else if (action === 'open-protected-composer') {
+      renderProtectedComposeModal();
+    } else if (action === 'copy-protected-password') {
+      await window.desktopApp.copyText(button.dataset.password);
+      showNotice('Password copied. Share it with the recipient in person.', 'success');
+    } else if (action === 'unlock-protected') {
+      const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
+      if (!message?.protected) throw new Error('This message is no longer available.');
+      renderUnlockModal(message);
+    } else if (action === 'lock-protected') {
+      state.unlockedMessages.delete(String(button.dataset.messageId));
+      renderMessages();
+    } else if (action === 'start-voice-recording') {
+      await startVoiceRecording();
+    } else if (action === 'cancel-voice-recording') {
+      cancelVoiceRecording();
+    } else if (action === 'send-voice-recording') {
+      button.disabled = true;
+      await finishVoiceRecording(true);
+    } else if (action === 'toggle-voice') {
+      await toggleVoicePlayback(button.dataset.messageId);
+    } else if (action === 'seek-voice') {
+      seekVoice(button, event.clientX);
     } else if (action === 'choose-attachment') {
       document.querySelector('#attachment-input')?.click();
     } else if (action === 'show-friends') {
@@ -2558,6 +3687,7 @@ app.addEventListener('click', async (event) => {
       const attachmentInput = document.querySelector('#attachment-input');
       if (attachmentInput) attachmentInput.value = '';
       clearAttachmentPreview();
+      cancelVoiceRecording();
       stopLocalTyping();
       clearTypingIndicator();
       render();
@@ -2584,7 +3714,7 @@ app.addEventListener('click', async (event) => {
       button.closest('.message-menu')?.removeAttribute('open');
       const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
       if (!message) throw new Error('This message is no longer available.');
-      const text = message.body || message.attachment?.name;
+      const text = state.unlockedMessages.get(String(message.id)) || message.body || message.attachment?.name;
       if (!text) throw new Error('This message has no text to copy.');
       await window.desktopApp.copyText(text);
       showNotice('Message copied.', 'success');
@@ -2646,11 +3776,26 @@ app.addEventListener('input', (event) => {
   if (event.target.id === 'friend-phone') {
     state.addFriendPhone = event.target.value;
   }
-  if (event.target.id === 'group-name') state.groupName = event.target.value;
+  if (event.target.id === 'group-name') {
+    state.groupName = event.target.value;
+    updateCreateGroupView();
+  }
+  if (event.target.id === 'group-friend-search') {
+    state.groupFriendQuery = event.target.value;
+    updateCreateGroupView();
+  }
   if (event.target.matches('#message-form textarea')) handleMessageTyping();
 });
 
 app.addEventListener('change', (event) => {
+  if (event.target.id === 'setting-notifications') {
+    updateSettings({ notifications: event.target.checked });
+    return;
+  }
+  if (event.target.id === 'setting-blur-messages') {
+    updateSettings({ blurMessages: event.target.checked });
+    return;
+  }
   if (event.target.matches('#forward-message-form input[name="target_conversation_ids"]')) {
     const count = document.querySelector('#forward-selection-count');
     if (count) {
@@ -2663,6 +3808,7 @@ app.addEventListener('change', (event) => {
     const friendId = String(event.target.value);
     if (event.target.checked) state.selectedGroupFriendIds.add(friendId);
     else state.selectedGroupFriendIds.delete(friendId);
+    updateCreateGroupView();
     return;
   }
   if (event.target.id === 'profile-picture-input') {
@@ -2694,7 +3840,7 @@ app.addEventListener('paste', (event) => {
 });
 
 app.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && document.querySelector('.modal-backdrop')) {
+  if (event.key === 'Escape' && document.querySelector('.modal-backdrop:not([data-sticky])')) {
     closeModal();
     return;
   }
@@ -2711,6 +3857,15 @@ app.addEventListener('keydown', (event) => {
   }
 });
 
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && state.voiceRecording) cancelVoiceRecording();
+});
+
+applySettings();
+window.desktopApp?.onOpenConversation?.((conversationId) => {
+  void openConversationById(conversationId).catch((error) =>
+    showNotice(error.message || 'The conversation could not be opened.'));
+});
 window.chatSocket?.onEvent(handleSocketEvent);
 checkForUpdates(false);
 

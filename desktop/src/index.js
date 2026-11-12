@@ -1,4 +1,4 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, session, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification, session, shell } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { io } = require('socket.io-client');
@@ -62,6 +62,14 @@ const SOCKET_EVENTS = [
   'call:signal',
   'call:busy',
   'call:error',
+  'group-call:invite',
+  'group-call:joined',
+  'group-call:participant-joined',
+  'group-call:participant-left',
+  'group-call:signal',
+  'group-call:dismissed',
+  'group-call:ended',
+  'group-call:error',
 ];
 const MEDIA_PERMISSIONS = new Set(['media', 'camera', 'microphone']);
 const CALL_CLIENT_EVENTS = new Set([
@@ -73,6 +81,11 @@ const CALL_CLIENT_EVENTS = new Set([
   'call:end',
   'call:connected',
   'call:signal',
+  'group-call:start',
+  'group-call:join',
+  'group-call:decline',
+  'group-call:leave',
+  'group-call:signal',
 ]);
 let mainWindow;
 let socketClient;
@@ -326,6 +339,42 @@ ipcMain.handle('chat:call-event', (_event, { event, payload } = {}) => {
   return true;
 });
 
+// Windows only shows toasts for an app whose ID matches its Start-menu
+// shortcut; Squirrel names it com.squirrel.<package name>.<executable name>.
+if (process.platform === 'win32') {
+  app.setAppUserModelId(app.isPackaged ? 'com.squirrel.desktop.PITBConnect' : process.execPath);
+}
+
+const activeNotifications = new Set();
+
+ipcMain.on('desktop:notify', (event, { title, body, conversationId } = {}) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+  if (typeof title !== 'string' || typeof body !== 'string' ||
+    !Number.isSafeInteger(conversationId) || conversationId < 1) {
+    console.error('Ignoring an invalid notification request from the renderer.');
+    return;
+  }
+  if (mainWindow.isFocused() || !Notification.isSupported()) return;
+
+  const notification = new Notification({
+    title: title.slice(0, 120),
+    body: body.slice(0, 240),
+  });
+  // Keep a reference so the notification is not garbage-collected before it is clicked.
+  activeNotifications.add(notification);
+  const release = () => activeNotifications.delete(notification);
+  notification.on('close', release);
+  notification.on('click', () => {
+    release();
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.webContents.send('desktop:open-conversation', conversationId);
+  });
+  notification.show();
+});
+
 ipcMain.on('chat:unread-count', (event, { count, notify } = {}) => {
   if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
   if (!Number.isSafeInteger(count) || count < 0 || typeof notify !== 'boolean') {
@@ -457,7 +506,7 @@ app.whenReady().then(() => {
     dialog.showMessageBox(mainWindow, {
       type: 'question',
       title: 'Allow microphone and camera',
-      message: 'PITBConnect needs access to your microphone and camera for calls.',
+      message: 'PITBConnect needs access to your microphone and camera for calls and voice messages.',
       buttons: ['Allow', 'Deny'],
       defaultId: 1,
       cancelId: 1,

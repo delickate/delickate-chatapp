@@ -24,6 +24,14 @@ const SOCKET_EVENTS = new Set([
   'call:signal',
   'call:busy',
   'call:error',
+  'group-call:invite',
+  'group-call:joined',
+  'group-call:participant-joined',
+  'group-call:participant-left',
+  'group-call:signal',
+  'group-call:dismissed',
+  'group-call:ended',
+  'group-call:error',
 ]);
 
 contextBridge.exposeInMainWorld('chatSocket', {
@@ -69,6 +77,13 @@ contextBridge.exposeInMainWorld('localAttachments', {
 
 contextBridge.exposeInMainWorld('desktopApp', {
   setUnreadCount: (count, notify) => ipcRenderer.send('chat:unread-count', { count, notify }),
+  showNotification: (notification) => ipcRenderer.send('desktop:notify', notification),
+  onOpenConversation: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_event, conversationId) => callback(conversationId);
+    ipcRenderer.on('desktop:open-conversation', listener);
+    return () => ipcRenderer.removeListener('desktop:open-conversation', listener);
+  },
   openExternal: (url) => ipcRenderer.invoke('desktop:open-external', url),
   copyText: (text) => ipcRenderer.invoke('desktop:copy-text', text),
   checkForUpdates: () => ipcRenderer.invoke('desktop:check-updates'),
