@@ -48,6 +48,13 @@ const SOCKET_EVENTS = [
   'presence:update',
   'conversation:joined',
   'conversation:message',
+  'conversation:read',
+  'message.created',
+  'message.updated',
+  'conversation.read',
+  'conversation.pins',
+  'conversation.changed',
+  'friends.changed',
   'conversation:typing',
   'conversation:stop-typing',
   'server:error',
@@ -328,6 +335,15 @@ ipcMain.handle('chat:message-event', (_event, { conversationId, messageId } = {}
   return true;
 });
 
+ipcMain.handle('chat:read-event', (_event, { conversationId } = {}) => {
+  if (!socketClient?.connected) return false;
+  if (!Number.isSafeInteger(Number(conversationId)) || Number(conversationId) < 1) {
+    throw new Error('The read notification is invalid.');
+  }
+  socketClient.emit('conversation:read', { conversation_id: Number(conversationId) });
+  return true;
+});
+
 ipcMain.handle('chat:call-event', (_event, { event, payload } = {}) => {
   if (!CALL_CLIENT_EVENTS.has(event)) {
     throw new Error('Unsupported call event.');
@@ -347,15 +363,7 @@ if (process.platform === 'win32') {
 
 const activeNotifications = new Set();
 
-ipcMain.on('desktop:notify', (event, { title, body, conversationId } = {}) => {
-  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
-  if (typeof title !== 'string' || typeof body !== 'string' ||
-    !Number.isSafeInteger(conversationId) || conversationId < 1) {
-    console.error('Ignoring an invalid notification request from the renderer.');
-    return;
-  }
-  if (mainWindow.isFocused() || !Notification.isSupported()) return;
-
+function showDesktopNotification({ title, body, conversationId }) {
   const notification = new Notification({
     title: title.slice(0, 120),
     body: body.slice(0, 240),
@@ -370,9 +378,36 @@ ipcMain.on('desktop:notify', (event, { title, body, conversationId } = {}) => {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     mainWindow.focus();
-    mainWindow.webContents.send('desktop:open-conversation', conversationId);
+    if (conversationId) mainWindow.webContents.send('desktop:open-conversation', conversationId);
+  });
+  notification.on('failed', (_event, error) => {
+    release();
+    console.error('Windows could not show the notification:', error);
   });
   notification.show();
+}
+
+ipcMain.on('desktop:notify', (event, { title, body, conversationId } = {}) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+  if (typeof title !== 'string' || typeof body !== 'string' ||
+    !Number.isSafeInteger(conversationId) || conversationId < 1) {
+    console.error('Ignoring an invalid notification request from the renderer.');
+    return;
+  }
+  if (mainWindow.isFocused() || !Notification.isSupported()) return;
+  showDesktopNotification({ title, body, conversationId });
+});
+
+// Settings > "Send a test notification": shown even while the app is focused,
+// so people can check that Windows allows PITBConnect's notifications.
+ipcMain.handle('desktop:test-notification', (event) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return false;
+  if (!Notification.isSupported()) return false;
+  showDesktopNotification({
+    title: 'PITBConnect',
+    body: 'Notifications are working. New messages will appear like this when the app is in the background.',
+  });
+  return true;
 });
 
 ipcMain.on('chat:unread-count', (event, { count, notify } = {}) => {

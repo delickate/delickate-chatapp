@@ -10,6 +10,13 @@ const SOCKET_EVENTS = new Set([
   'presence:update',
   'conversation:joined',
   'conversation:message',
+  'conversation:read',
+  'message.created',
+  'message.updated',
+  'conversation.read',
+  'conversation.pins',
+  'conversation.changed',
+  'friends.changed',
   'conversation:typing',
   'conversation:stop-typing',
   'server:error',
@@ -53,6 +60,7 @@ contextBridge.exposeInMainWorld('chatSocket', {
     conversationId,
     messageId,
   }),
+  notifyRead: (conversationId) => ipcRenderer.invoke('chat:read-event', { conversationId }),
   sendCallEvent: (event, payload) => ipcRenderer.invoke('chat:call-event', { event, payload }),
   onEvent: (callback) => {
     if (typeof callback !== 'function') {
@@ -78,6 +86,7 @@ contextBridge.exposeInMainWorld('localAttachments', {
 contextBridge.exposeInMainWorld('desktopApp', {
   setUnreadCount: (count, notify) => ipcRenderer.send('chat:unread-count', { count, notify }),
   showNotification: (notification) => ipcRenderer.send('desktop:notify', notification),
+  testNotification: () => ipcRenderer.invoke('desktop:test-notification'),
   onOpenConversation: (callback) => {
     if (typeof callback !== 'function') return () => {};
     const listener = (_event, conversationId) => callback(conversationId);

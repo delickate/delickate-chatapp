@@ -8,7 +8,10 @@ const SETTINGS_KEY = 'pitbconnect.settings';
 const DEFAULT_SETTINGS = { notifications: true, blurMessages: false };
 const DEFAULT_API_URL = 'https://api.sanjakarobar.com/api';
 const DEFAULT_SOCKET_URL = 'https://socket.sanjakarobar.com';
+// Background sync. With the realtime socket connected, messages arrive
+// instantly, so polling only catches up on friend requests and receipts.
 const REFRESH_INTERVAL = 5000;
+const CONNECTED_REFRESH_INTERVAL = 30000;
 const MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024;
 const ALLOWED_ATTACHMENT_EXTENSIONS = new Set([
   'jpg', 'jpeg', 'jpe', 'jfif', 'png', 'gif', 'webp', 'bmp', 'dib', 'tif', 'tiff', 'ico', 'avif', 'heic', 'heif',
@@ -20,6 +23,12 @@ const CACHED_IMAGE_TYPES = new Set([
   'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp', 'image/avif',
 ]);
 const TYPING_TIMEOUT = 1400;
+// Messages per request: a chat opens with the newest page, and older pages load
+// as you scroll up.
+const MESSAGE_PAGE_SIZE = 30;
+const DEFAULT_MESSAGE_EDIT_MINUTES = 5;
+// Must match User::MESSAGE_EDIT_MINUTE_OPTIONS in the API; 0 turns editing off.
+const MESSAGE_EDIT_MINUTE_OPTIONS = [0, 1, 2, 5, 10, 15, 30, 60];
 const MAX_VOICE_SECONDS = 300;
 // Protected messages: 20 characters from a 32-symbol alphabet without look-alike
 // characters (no I, O, 0, 1) gives 100 bits of randomness, far beyond what can
@@ -68,7 +77,19 @@ const state = {
   settings: readSettings(),
   selectedConversationId: null,
   messages: [],
+  // How far each member has read the selected conversation (from the API).
+  readCursors: [],
+  pinnedMessages: [],
+  // 'chats' = friends and groups; 'others' = chats with people who are not friends.
+  chatListTab: 'chats',
+  pinIndex: 0,
+  callHistoryFilter: 'all',
+  latestMissedCallId: 0,
+  messagesLoading: false,
+  hasOlderMessages: false,
+  loadingOlderMessages: false,
   replyTarget: null,
+  editTarget: null,
   selectedAttachment: null,
   previewImageUrl: null,
   cachedAttachments: new Map(),
@@ -99,11 +120,28 @@ const state = {
   pendingCallSignals: [],
   groupPeers: new Map(),
   recentGroupCallIds: new Set(),
+  // Message search. Messages are end-to-end encrypted, so they are searched in
+  // a local index of decrypted messages that lives only for this session.
+  searchIndex: new Map(),
+  chatSearch: { open: false, conversationId: null, query: '', status: '', html: '' },
+  chatSearchToken: 0,
+  globalSearch: { query: '', status: '', html: '' },
+  globalSearchToken: 0,
   iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
   voiceRecording: null,
   voicePlayer: null,
   voiceBlobUrls: new Map(),
   unlockedMessages: new Map(),
+  // Messages this device is sending or has just sent, keyed by a temporary id,
+  // so they stay visible until a reload from the server includes them.
+  outgoing: new Map(),
+  sendQueue: Promise.resolve(),
+  // Message encryption: imported AES keys by "conversationId:version", the newest
+  // version per conversation, in-flight key requests, and decrypted content.
+  conversationKeys: new Map(),
+  latestKeyVersions: new Map(),
+  keyRequests: new Map(),
+  decryptedContent: new Map(),
 };
 
 // Line icons for the left navigation (24px grid, drawn with currentColor).
@@ -190,7 +228,8 @@ function readStoredUser() {
 
 function updateCallButtons() {
   const available = Boolean(state.joinedRoomId &&
-    String(state.joinedRoomId) === String(state.selectedConversationId));
+    String(state.joinedRoomId) === String(state.selectedConversationId)) &&
+    !isReadOnly(selectedConversation());
   document.querySelectorAll('[data-action="call-audio"], [data-action="call-video"]')
     .forEach((button) => {
       button.disabled = !available;
@@ -272,8 +311,10 @@ function formatCallDuration(value) {
 function messagePreview(message, fallback = '') {
   if (message?.type === 'call' && message.call) {
     const mediaName = message.call.media_type === 'video' ? 'video' : 'voice';
+    // A missed call you placed (unanswered, declined or cancelled) is "no answer" for you.
+    const outgoing = String(message.sender?.id) === String(state.user?.id);
     return message.call.status === 'missed'
-      ? `Missed ${mediaName} call`
+      ? (outgoing ? `${mediaName === 'video' ? 'Video' : 'Voice'} call · No answer` : `Missed ${mediaName} call`)
       : `${mediaName === 'video' ? 'Video' : 'Voice'} call · ${formatCallDuration(message.call.duration_seconds)}`;
   }
   if (message?.type === 'protected') return '🔒 Protected message';
@@ -382,11 +423,192 @@ async function api(path, options = {}) {
   return payload;
 }
 
+// ---------------------------------------------------------------------------
+// Message encryption
+//
+// Every conversation has a random AES-256 key that the API hands to its members
+// (any signed-in device, no password needed). Message text, captions, and file
+// details are encrypted here before upload, and each file is encrypted with its
+// own random key that travels inside the encrypted message. The database and
+// file storage only ever hold ciphertext. The format is shared with the mobile app:
+//   body      = {"v":1,"iv":<base64>,"ct":<base64>}   AES-256-GCM with the
+//               conversation key, additional data "pitbconnect:<conversation>:<version>"
+//   plaintext = {"text": string|null, "file": {name, mime, size, key, iv} | null}
+//   file      = AES-256-GCM with the file key and iv, no additional data
+// ---------------------------------------------------------------------------
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+const UNDECRYPTABLE_TEXT = '⚠ This message could not be decrypted.';
+
+async function rememberConversationKeys(keys) {
+  await Promise.all((Array.isArray(keys) ? keys : []).map(async (item) => {
+    const conversationId = String(item.conversation_id);
+    const version = Number(item.version);
+    const mapKey = `${conversationId}:${version}`;
+    if (!state.conversationKeys.has(mapKey)) {
+      state.conversationKeys.set(mapKey, await crypto.subtle.importKey(
+        'raw', base64ToBytes(item.key), 'AES-GCM', false, ['encrypt', 'decrypt'],
+      ));
+    }
+    if (version > (state.latestKeyVersions.get(conversationId) || 0)) {
+      state.latestKeyVersions.set(conversationId, version);
+    }
+  }));
+}
+
+function fetchConversationKeys(conversationId) {
+  const id = String(conversationId);
+  if (!state.keyRequests.has(id)) {
+    state.keyRequests.set(id, api(`/conversations/${encodeURIComponent(id)}/keys`)
+      .then((result) => rememberConversationKeys(result.data))
+      .finally(() => state.keyRequests.delete(id)));
+  }
+  return state.keyRequests.get(id);
+}
+
+async function conversationKey(conversationId, version) {
+  const mapKey = `${conversationId}:${version}`;
+  if (!state.conversationKeys.has(mapKey)) await fetchConversationKeys(conversationId);
+  const key = state.conversationKeys.get(mapKey);
+  if (!key) throw new Error('The encryption key for this conversation is not available.');
+  return key;
+}
+
+function encryptionContext(conversationId, version) {
+  return textEncoder.encode(`pitbconnect:${conversationId}:${version}`);
+}
+
+async function encryptMessageContent(conversationId, content, refreshKeys = false) {
+  const id = String(conversationId);
+  if (refreshKeys || !state.latestKeyVersions.has(id)) await fetchConversationKeys(id);
+  const version = state.latestKeyVersions.get(id);
+  if (!version) throw new Error('This conversation has no encryption key yet. Refresh and try again.');
+  const key = await conversationKey(id, version);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = textEncoder.encode(JSON.stringify({ text: content.text ?? null, file: content.file ?? null }));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: encryptionContext(id, version) }, key, plaintext,
+  );
+  return {
+    encrypted: true,
+    key_version: version,
+    body: JSON.stringify({ v: 1, iv: bytesToBase64(iv), ct: bytesToBase64(new Uint8Array(ciphertext)) }),
+  };
+}
+
+// Encrypts and sends; if the server reports that the conversation has a newer
+// key (someone left a group), refreshes the keys and tries once more.
+async function sendEncrypted(conversationId, content, send) {
+  try {
+    return await send(await encryptMessageContent(conversationId, content));
+  } catch (error) {
+    if (!/newer encryption key/i.test(error.message || '')) throw error;
+    return send(await encryptMessageContent(conversationId, content, true));
+  }
+}
+
+async function decryptMessageContent(conversationId, version, body) {
+  const envelope = JSON.parse(body);
+  if (envelope?.v !== 1) throw new Error('Unsupported encryption format.');
+  const key = await conversationKey(String(conversationId), version);
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: base64ToBytes(envelope.iv), additionalData: encryptionContext(String(conversationId), version) },
+    key,
+    base64ToBytes(envelope.ct),
+  );
+  const content = JSON.parse(textDecoder.decode(plaintext));
+  return {
+    text: typeof content?.text === 'string' ? content.text : null,
+    file: content?.file && typeof content.file === 'object' ? content.file : null,
+  };
+}
+
+async function encryptFileBytes(bytes) {
+  const rawKey = crypto.getRandomValues(new Uint8Array(32));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt']);
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes);
+  return { data: new Uint8Array(ciphertext), key: bytesToBase64(rawKey), iv: bytesToBase64(iv) };
+}
+
+async function decryptFileBytes(bytes, attachment) {
+  const key = await crypto.subtle.importKey('raw', base64ToBytes(attachment.fileKey), 'AES-GCM', false, ['decrypt']);
+  return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToBytes(attachment.fileIv) }, key, bytes));
+}
+
+async function decryptedContentFor(conversationId, item) {
+  const cacheKey = `${conversationId}|${item.key_version}|${item.body}`;
+  const cached = state.decryptedContent.get(cacheKey);
+  if (cached) return cached;
+  try {
+    const content = await decryptMessageContent(conversationId, item.key_version, item.body);
+    if (state.decryptedContent.size >= 5000) state.decryptedContent.clear();
+    state.decryptedContent.set(cacheKey, content);
+    return content;
+  } catch {
+    return null;
+  }
+}
+
+// Turns an encrypted message from the API into the plain shape the rest of the
+// app works with. File keys stay on the attachment so downloads can be decrypted.
+async function decryptForDisplay(conversationId, message) {
+  if (!message) return message;
+  let result = message;
+  if (message.encrypted && message.body) {
+    const content = await decryptedContentFor(conversationId, message);
+    result = content
+      ? {
+        ...message,
+        body: content.text,
+        attachment: message.attachment && content.file ? {
+          name: String(content.file.name || 'attachment'),
+          mime: String(content.file.mime || 'application/octet-stream'),
+          size: Number(content.file.size) || message.attachment.size,
+          encrypted: true,
+          fileKey: content.file.key,
+          fileIv: content.file.iv,
+        } : message.attachment,
+      }
+      : { ...message, body: UNDECRYPTABLE_TEXT, attachment: null, decryption_failed: true };
+  }
+  const reply = result.reply_to;
+  if (reply?.key_version && reply.body) {
+    const content = await decryptedContentFor(conversationId, reply);
+    result = {
+      ...result,
+      reply_to: content
+        ? { ...reply, body: content.text, attachment: content.file ? { name: String(content.file.name || 'attachment') } : reply.attachment }
+        : { ...reply, body: UNDECRYPTABLE_TEXT, attachment: null },
+    };
+  }
+  return result;
+}
+
+function decryptMessagesForDisplay(conversationId, messages) {
+  return Promise.all(messages.map((message) => decryptForDisplay(conversationId, message)));
+}
+
+function decryptConversationPreviews(conversations) {
+  return Promise.all(conversations.map(async (conversation) => conversation.last_message
+    ? { ...conversation, last_message: await decryptForDisplay(conversation.id, conversation.last_message) }
+    : conversation));
+}
+
+function attachmentExtensionAllowed(name) {
+  const extension = String(name || '').split('.').pop()?.toLowerCase();
+  return Boolean(extension && ALLOWED_ATTACHMENT_EXTENSIONS.has(extension));
+}
+
 async function downloadAttachment(message) {
   const conversation = selectedConversation();
   if (!conversation || !message?.attachment) return;
+  if (message.attachment.encrypted && !attachmentExtensionAllowed(message.attachment.name)) {
+    throw new Error(`"${message.attachment.name}" is not an allowed file type, so it was not downloaded.`);
+  }
 
-  const blob = await fetchAttachmentBlob(conversation.id, message.id);
+  const blob = await fetchAttachmentBlob(conversation.id, message);
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
@@ -397,7 +619,8 @@ async function downloadAttachment(message) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-async function fetchAttachmentBlob(conversationId, messageId) {
+async function fetchAttachmentBlob(conversationId, message) {
+  const messageId = message.id;
   let response;
   try {
     response = await fetch(
@@ -417,7 +640,14 @@ async function fetchAttachmentBlob(conversationId, messageId) {
     throw new Error(apiErrorMessage(payload, response.status));
   }
 
-  return response.blob();
+  const blob = await response.blob();
+  if (!message.attachment?.fileKey) return blob;
+  try {
+    const bytes = await decryptFileBytes(new Uint8Array(await blob.arrayBuffer()), message.attachment);
+    return new Blob([bytes], { type: message.attachment.mime || 'application/octet-stream' });
+  } catch {
+    throw new Error(`"${message.attachment.name}" could not be decrypted.`);
+  }
 }
 
 function attachmentCacheKey(conversationId, messageId) {
@@ -441,7 +671,7 @@ async function cacheImageAttachment(conversationId, message) {
     };
     let dataUrl = await window.localAttachments.readImage(cacheDetails);
     if (!dataUrl) {
-      const blob = await fetchAttachmentBlob(conversationId, message.id);
+      const blob = await fetchAttachmentBlob(conversationId, message);
       if (blob.size > MAX_ATTACHMENT_SIZE || blob.type !== attachment.mime) {
         throw new Error(`The image "${attachment.name}" could not be verified.`);
       }
@@ -477,6 +707,17 @@ function clearSession() {
   cancelVoiceRecording();
   releaseVoiceBlobs();
   state.unlockedMessages.clear();
+  state.outgoing.clear();
+  state.sendQueue = Promise.resolve();
+  state.conversationKeys.clear();
+  state.latestKeyVersions.clear();
+  state.keyRequests.clear();
+  state.decryptedContent.clear();
+  state.searchIndex.clear();
+  state.chatSearch = { open: false, conversationId: null, query: '', status: '', html: '' };
+  state.globalSearch = { query: '', status: '', html: '' };
+  state.chatSearchToken += 1;
+  state.globalSearchToken += 1;
   state.token = null;
   state.user = null;
   state.friends = [];
@@ -507,6 +748,27 @@ function clearSession() {
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(USER_KEY);
   stopPolling();
+}
+
+function storeUser(user) {
+  state.user = user;
+  localStorage.setItem(USER_KEY, JSON.stringify(user));
+}
+
+function messageEditMinutes() {
+  const minutes = Number(state.user?.message_edit_minutes);
+  return Number.isInteger(minutes) && minutes >= 0 ? minutes : DEFAULT_MESSAGE_EDIT_MINUTES;
+}
+
+// Whether the edit option should be offered; the API makes the final decision.
+function canEditMessage(message) {
+  const minutes = messageEditMinutes();
+  return minutes > 0 &&
+    !message.pending &&
+    message.type === 'text' &&
+    !message.deleted_for_everyone_at &&
+    String(message.sender?.id) === String(state.user?.id) &&
+    Date.now() - Date.parse(message.created_at) < minutes * 60_000;
 }
 
 function persistSession(payload) {
@@ -649,6 +911,9 @@ function conversationAvatar(conversation, size = 'sm', withPresence = false) {
   if (conversation?.type !== 'group') {
     return friendAvatar(conversation?.friend, size, withPresence);
   }
+  if (conversation.icon_url) {
+    return `<img class="avatar ${size} avatar-image" src="${escapeHtml(conversation.icon_url)}" alt="${escapeHtml(conversation.name || 'Group')}" loading="lazy" decoding="async">`;
+  }
   return `<span class="avatar ${size} group-avatar" aria-label="Group">${escapeHtml(initials(conversation.name))}</span>`;
 }
 
@@ -672,7 +937,7 @@ function showChatShell() {
           <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="search" aria-label="Search" aria-expanded="false" title="Search">${navIcon('search')}</button>
           <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="add" aria-label="Add a friend" aria-expanded="false" title="Add a friend">${navIcon('addFriend')}</button>
           <button class="app-nav-button" type="button" data-action="open-create-group" aria-label="Create a group" aria-haspopup="dialog" title="Create a group">${navIcon('group')}</button>
-          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="calls" aria-label="Call history" aria-expanded="false" title="Call history">${navIcon('calls')}</button>
+          <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="calls" aria-label="Call history" aria-expanded="false" title="Call history">${navIcon('calls')}<span class="tool-badge" id="missed-call-count" hidden></span></button>
           <button class="app-nav-button request-tool" type="button" data-action="toggle-sidebar-tool" data-tool="requests" aria-label="Friend requests" aria-expanded="false" title="Friend requests">${navIcon('requests')}<span class="tool-badge" id="request-count" hidden></span></button>
           <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="blocked" aria-label="Blocked users" aria-expanded="false" title="Blocked users">${navIcon('blocked')}</button>
         </div>
@@ -684,10 +949,15 @@ function showChatShell() {
       </nav>
       <aside class="rail">
         <div class="sidebar-tools" id="sidebar-tools" hidden></div>
-        <div class="friend-list-heading"><h2>Chats</h2><span class="unread-total" id="unread-message-count" hidden></span></div>
+        <div class="friend-list-heading">
+          <div class="chat-list-tabs" role="tablist" aria-label="Chat lists">
+            <button type="button" role="tab" data-action="chat-list-tab" data-tab="chats" aria-selected="true" class="active">Chats<span class="unread-total" id="unread-message-count" hidden></span></button>
+            <button type="button" role="tab" data-action="chat-list-tab" data-tab="others" aria-selected="false" title="Chats with people who are not your friends">Others<span class="unread-total" id="others-unread-count" hidden></span></button>
+          </div>
+        </div>
         <div class="friend-list" id="friend-list"></div>
         <div class="profile">
-          <button class="profile-avatar-button" type="button" data-action="open-profile" aria-label="Open profile" title="Open profile">
+          <button class="profile-avatar-button" type="button" data-action="open-profile" aria-label="Open profile" title="Your profile · change picture">
             ${friendAvatar(state.user, 'sm')}
           </button>
           <div class="person-info"><div class="person-name">${escapeHtml(state.user.name)}</div><div class="person-sub">${escapeHtml(state.user.phone)}</div></div>
@@ -746,16 +1016,18 @@ function renderSidebar() {
 function renderSidebarTool() {
   if (state.sidebarTool === 'search') {
     return `
-      <label class="search-box friend-search"><span aria-hidden="true">⌕</span><input id="friend-search" type="search" value="${escapeHtml(state.friendSearchQuery)}" placeholder="Search friends or messages" aria-label="Search friends or messages" /></label>`;
+      <label class="search-box friend-search"><span aria-hidden="true">⌕</span><input id="friend-search" type="search" value="${escapeHtml(state.friendSearchQuery)}" placeholder="Search chats and messages" aria-label="Search chats and messages" /></label>`;
   }
   if (state.sidebarTool === 'add') {
     return `
       <form class="add-friend" id="add-friend-form">
-        <label class="tool-field-label" for="friend-phone">Add a friend by phone</label>
+        <label class="tool-field-label" for="friend-phone">Add a friend or message by phone</label>
         <div class="add-friend-entry">
-          <input id="friend-phone" name="phone" type="tel" inputmode="tel" pattern="\\+[1-9][0-9]{7,14}" placeholder="+1 555 123 4567" value="${escapeHtml(state.addFriendPhone)}" aria-label="Friend's phone number" required />
-          <button type="submit" title="Send friend request" aria-label="Send friend request">Send</button>
+          <input id="friend-phone" name="phone" type="tel" inputmode="tel" pattern="\\+[1-9][0-9]{7,14}" placeholder="+1 555 123 4567" value="${escapeHtml(state.addFriendPhone)}" aria-label="Phone number" required />
+          <button type="submit" title="Send friend request" aria-label="Send friend request">Add</button>
+          <button type="button" data-action="message-by-phone" title="Message without adding as a friend" aria-label="Message without adding as a friend">Message</button>
         </div>
+        <p class="add-friend-hint">"Message" starts a chat without adding them. They will see it as a message request.</p>
       </form>`;
   }
   if (state.sidebarTool === 'requests') {
@@ -780,16 +1052,20 @@ function renderSidebarTool() {
     return `
       <section class="tool-section" aria-label="Call history">
         <div class="call-history-heading"><h2>Call history</h2><button class="small-button" type="button" data-action="refresh-call-history" ${state.callHistoryLoading ? 'disabled' : ''}>Refresh</button></div>
+        <div class="call-history-tabs" role="tablist" aria-label="Filter calls">
+          ${[['all', 'All'], ['missed', 'Missed']].map(([filter, label]) => `<button type="button" role="tab" aria-selected="${state.callHistoryFilter === filter}" class="${state.callHistoryFilter === filter ? 'active' : ''}" data-action="call-filter" data-filter="${filter}">${label}</button>`).join('')}
+        </div>
         ${state.callHistoryError
           ? `<div class="empty-list call-history-error">${escapeHtml(state.callHistoryError)} <button class="text-button" type="button" data-action="refresh-call-history">Try again</button></div>`
           : state.callHistoryLoading && state.callHistoryPage === 0
             ? '<div class="empty-list">Loading call history…</div>'
             : state.callHistory.length
               ? `<div class="call-history-list">${state.callHistory.map((call) => {
-                const missed = call.status === 'missed';
+                const missed = call.status === 'missed' && call.direction !== 'outgoing';
+                const unanswered = call.status === 'missed' && call.direction === 'outgoing';
                 const mediaKind = call.media_type === 'video' ? 'video call' : 'voice call';
                 const mediaLabel = call.group ? `Group ${mediaKind}` : mediaKind.charAt(0).toUpperCase() + mediaKind.slice(1);
-                const statusLabel = missed ? 'Missed' : formatCallDuration(call.duration_seconds);
+                const statusLabel = missed ? 'Missed' : unanswered ? 'No answer' : formatCallDuration(call.duration_seconds);
                 const directionLabel = call.direction === 'outgoing' ? 'Outgoing' : 'Incoming';
                 const contactName = call.group ? call.group.name || 'Group' : call.contact?.name || 'Unknown contact';
                 return `<article class="call-history-entry${missed ? ' missed' : ''}">
@@ -829,6 +1105,18 @@ function renderSidebarTool() {
     return `
       <section class="tool-section settings-section" aria-label="Settings">
         <h2>Settings</h2>
+        <div class="settings-profile">
+          ${friendAvatar(state.user, 'lg')}
+          <div class="settings-profile-text">
+            <strong>${escapeHtml(state.user.name)}</strong>
+            <span>${escapeHtml(state.user.phone || '')}</span>
+            <span class="settings-profile-actions">
+              <button class="small-button" type="button" data-action="choose-profile-picture">${state.user.avatar_url ? 'Change profile picture' : 'Add profile picture'}</button>
+              ${state.user.avatar_url ? '<button class="secondary-button" type="button" data-action="remove-profile-picture">Remove</button>' : ''}
+            </span>
+          </div>
+          <input id="profile-picture-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+        </div>
         <label class="setting-row" for="setting-notifications">
           <span class="setting-text">
             <strong>Message notifications</strong>
@@ -836,6 +1124,9 @@ function renderSidebarTool() {
           </span>
           <input class="setting-switch" type="checkbox" role="switch" id="setting-notifications" ${state.settings.notifications ? 'checked' : ''}>
         </label>
+        <div class="setting-action">
+          <button class="small-button" type="button" data-action="test-notification">Send a test notification</button>
+        </div>
         <label class="setting-row" for="setting-blur-messages">
           <span class="setting-text">
             <strong>Blur messages</strong>
@@ -843,22 +1134,54 @@ function renderSidebarTool() {
           </span>
           <input class="setting-switch" type="checkbox" role="switch" id="setting-blur-messages" ${state.settings.blurMessages ? 'checked' : ''}>
         </label>
-        <p class="setting-note">Settings are saved on this computer.</p>
+        <label class="setting-row" for="setting-edit-minutes">
+          <span class="setting-text">
+            <strong>Edit sent messages</strong>
+            <span>How long after sending you can edit a text message. Others see an "edited" label. Saved to your account.</span>
+          </span>
+          <select class="setting-select" id="setting-edit-minutes">
+            ${MESSAGE_EDIT_MINUTE_OPTIONS.map((minutes) => `<option value="${minutes}" ${minutes === messageEditMinutes() ? 'selected' : ''}>${minutes === 0 ? 'Off' : `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`}</option>`).join('')}
+          </select>
+        </label>
+        <p class="setting-note">Notification and blur settings are saved on this computer.</p>
       </section>`;
   }
   if (state.sidebarTool === 'updates') return updateControls();
   return '';
 }
 
+// A one-to-one chat with someone who is not (or no longer) a friend: message
+// requests, people messaged by number, and blocked non-friends. These live in
+// the "Others" list and move to "Chats" as soon as the two become friends.
+function isOthersConversation(conversation) {
+  return Boolean(conversation && conversation.type !== 'group' && conversation.friend &&
+    !state.friends.some((friend) => String(friend.id) === String(conversation.friend.id)));
+}
+
+function updateChatListTabs() {
+  document.querySelectorAll('[data-action="chat-list-tab"]').forEach((tab) => {
+    const active = tab.dataset.tab === state.chatListTab;
+    tab.classList.toggle('active', active);
+    tab.setAttribute('aria-selected', String(active));
+  });
+}
+
 function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.friendSearchQuery : '') {
   const friendList = document.querySelector('#friend-list');
   if (!friendList) return;
   const filter = filterValue.trim().toLowerCase();
+  updateChatListTabs();
+  // Searching looks through both lists.
+  const showChats = Boolean(filter) || state.chatListTab === 'chats';
+  const showOthers = Boolean(filter) || state.chatListTab === 'others';
   const entries = [
-    ...state.friends.map((friend) => ({ kind: 'friend', friend, conversation: conversationForFriend(friend.id) })),
-    ...state.conversations
+    ...(showChats ? state.friends.map((friend) => ({ kind: 'friend', friend, conversation: conversationForFriend(friend.id) })) : []),
+    ...(showOthers ? state.conversations
+      .filter(isOthersConversation)
+      .map((conversation) => ({ kind: 'friend', friend: conversation.friend, conversation })) : []),
+    ...(showChats ? state.conversations
       .filter((conversation) => conversation.type === 'group')
-      .map((conversation) => ({ kind: 'group', conversation })),
+      .map((conversation) => ({ kind: 'group', conversation })) : []),
   ].filter(({ friend, conversation }) => {
     const preview = messagePreview(conversation?.last_message);
     return !filter || `${friend?.name || conversationTitle(conversation)} ${preview}`
@@ -871,7 +1194,9 @@ function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.f
     if (Number.isNaN(rightTime)) return -1;
     return rightTime - leftTime;
   });
-  friendList.innerHTML = entries.length
+  const searchingMessages = Boolean(filter) && state.sidebarTool === 'search';
+  if (state.sidebarTool === 'search') scheduleGlobalSearch(filter);
+  friendList.innerHTML = (searchingMessages ? '<div class="search-section-title">Chats</div>' : '') + (entries.length
     ? entries.map(({ kind, friend, conversation }) => {
       if (kind === 'group') return renderGroupListItem(conversation);
       const unreadCount = Number(conversation?.unread_count) || 0;
@@ -884,7 +1209,7 @@ function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.f
         <div class="friend-item ${String(selectedConversation()?.friend?.id) === String(friend.id) ? 'active' : ''} ${unreadCount ? 'has-unread' : ''}">
           ${userProfileButton(friend, 'sm', true)}
           <div class="person-info friend-item-main">
-            <button class="user-profile-name" type="button" data-action="open-user-profile" data-id="${escapeHtml(friend.id)}">${escapeHtml(friend.name)}</button>
+            <button class="user-profile-name" type="button" data-action="open-user-profile" data-id="${escapeHtml(friend.id)}">${escapeHtml(friend.name)}</button>${conversationTag(conversation)}
             <button class="conversation-preview friend-item-open-chat" type="button" data-action="open-friend" data-id="${escapeHtml(friend.id)}">${escapeHtml(previewText)}</button>
           </div>
           <div class="conversation-meta">${lastMessage ? formattedTime(lastMessage.created_at) : ''}
@@ -892,9 +1217,14 @@ function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.f
           </div>
         </div>`;
     }).join('')
-    : state.friends.length || state.conversations.some((conversation) => conversation.type === 'group')
-      ? '<div class="empty-list">No friends match your search.</div>'
-      : '<div class="empty-list">Your friends and groups will appear here. Select Add or Group to get started.</div>';
+    : filter
+      ? '<div class="empty-list">No chats match your search.</div>'
+      : state.chatListTab === 'others'
+        ? '<div class="empty-list">Chats with people who are not your friends appear here, such as message requests and people you message by phone number. Add them as a friend to move the chat to Chats.</div>'
+        : state.friends.length || state.conversations.some((conversation) => conversation.type === 'group')
+          ? '<div class="empty-list">No chats yet.</div>'
+          : '<div class="empty-list">Your friends and groups will appear here. Select Add or Group to get started.</div>')
+    + (searchingMessages && filter.length >= 2 ? globalSearchMarkup() : '');
 }
 
 function renderGroupListItem(conversation) {
@@ -930,23 +1260,29 @@ function renderThread() {
   }
 
   const groupMembers = conversation.type === 'group' ? (conversation.participants || []).filter((member) => member && member.id) : [];
+  const searchFocused = document.activeElement?.id === 'chat-search-input';
   panel.innerHTML = `
     <header class="chat-header">
       <button class="icon-button back-to-friends" type="button" data-action="show-friends" title="Back to friends" aria-label="Back to friends">‹</button>
       ${conversation.type === 'group'
-        ? `${conversationAvatar(conversation, 'lg')}<div class="chat-heading"><h2>${escapeHtml(conversationTitle(conversation))}</h2><p id="chat-status" title="${groupMembers.length} group members">${groupMembers.length} members</p></div>`
+        ? `${conversationAvatar(conversation, 'lg')}<div class="chat-heading"><h2>${escapeHtml(conversationTitle(conversation))} <span class="member-count-chip" title="${groupMembers.length} group members">👥 ${groupMembers.length} ${groupMembers.length === 1 ? 'member' : 'members'}</span></h2><p id="chat-status">${escapeHtml(presenceText())}</p></div>`
         : `<button class="chat-user-profile" type="button" data-action="open-user-profile" data-id="${escapeHtml(conversation.friend?.id)}" aria-label="View ${escapeHtml(conversation.friend?.name || 'friend')}'s profile" title="View profile">${friendAvatar(conversation.friend, 'lg', true)}<span class="chat-heading"><h2>${escapeHtml(conversationTitle(conversation))}</h2><p id="chat-status" title="${escapeHtml(presenceText(conversation.friend?.id))}">${presenceText(conversation.friend?.id)}</p></span></button>`}
       <div class="chat-actions">
+        <button class="icon-button" type="button" data-action="open-chat-search" title="Search messages (Ctrl+F)" aria-label="Search messages in this chat"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20.5 20.5-4.5-4.5"/></svg></button>
         ${conversation.type === 'group' ? `<button class="icon-button group-members-button" type="button" data-action="open-group-members" data-id="${escapeHtml(conversation.id)}" title="View group members" aria-label="View ${groupMembers.length} group members"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 19v-1a6 6 0 0 1 12 0v1"/><path d="M16 5.5a3 3 0 0 1 0 5.8M18 14a5 5 0 0 1 3 4.5v.5"/></svg><span class="group-member-count">${groupMembers.length}</span></button>` : ''}
         <button class="icon-button" type="button" data-action="unfriend" data-id="${escapeHtml(conversation.friend?.id)}" title="Remove friend" aria-label="Remove ${escapeHtml(conversation.friend?.name || 'friend')}" ${conversation.type === 'group' ? 'hidden' : ''}>✕</button>
         <button class="icon-button" type="button" data-action="block-user" data-id="${escapeHtml(conversation.friend?.id)}" title="Block user" aria-label="Block ${escapeHtml(conversation.friend?.name || 'user')}" ${conversation.type === 'group' ? 'hidden' : ''}>⊘</button>
         <button class="icon-button" type="button" data-action="call-audio" title="${conversation.type === 'group' ? 'Start group voice call' : 'Start voice call'}" aria-label="${conversation.type === 'group' ? 'Start group voice call' : 'Start voice call'}" ${state.joinedRoomId ? '' : 'disabled'}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.2 3.8 9.5 3.3a1.6 1.6 0 0 1 1.8 1.1l.8 2.8a1.6 1.6 0 0 1-.7 1.8l-1.6 1.1a14 14 0 0 0 4.1 4.1l1.1-1.6a1.6 1.6 0 0 1 1.8-.7l2.8.8a1.6 1.6 0 0 1 1.1 1.8l-.5 2.3a2 2 0 0 1-2 1.6A15.5 15.5 0 0 1 5.6 5.8a2 2 0 0 1 1.6-2Z"/></svg></button>
         <button class="icon-button" type="button" data-action="call-video" title="${conversation.type === 'group' ? 'Start group video call' : 'Start video call'}" aria-label="${conversation.type === 'group' ? 'Start group video call' : 'Start video call'}" ${state.joinedRoomId ? '' : 'disabled'}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="12" height="12" rx="2"/><path d="m15 10 6-3v10l-6-3z"/></svg></button>
+        <button class="icon-button" type="button" data-action="clear-chat" title="Clear chat (only for you)" aria-label="Clear chat for you"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg></button>
         <button class="icon-button" type="button" data-action="refresh" title="Refresh messages" aria-label="Refresh messages">↻</button>
       </div>
     </header>
+    <div class="chat-search" id="chat-search" hidden></div>
+    <div class="pinned-bar" id="pinned-bar" hidden></div>
     <div class="message-list" id="message-list"></div>
     <div class="composer-wrap">
+      <div class="chat-banner" id="chat-banner" role="status" hidden></div>
       <div class="attachment-preview" id="attachment-preview" aria-live="polite" hidden></div>
       <div class="reply-preview" id="reply-preview" hidden></div>
       <div class="voice-recorder" id="voice-recorder" role="group" aria-label="Recording a voice message" hidden></div>
@@ -968,6 +1304,8 @@ function renderThread() {
   renderMessages();
   updateReplyPreview();
   renderVoiceRecorder();
+  renderChatBanner();
+  renderChatSearch(searchFocused);
 }
 
 function renderProfileModal() {
@@ -981,7 +1319,8 @@ function renderProfileModal() {
         <div class="profile-modal-avatar">${friendAvatar(state.user, 'lg')}</div>
         <div class="profile-modal-name">${escapeHtml(state.user.name)}</div>
         <div class="profile-modal-phone">${escapeHtml(state.user.phone)}</div>
-        <button class="primary-button profile-change-button" type="button" data-action="choose-profile-picture">Change profile picture</button>
+        <button class="primary-button profile-change-button" type="button" data-action="choose-profile-picture">${state.user.avatar_url ? 'Change profile picture' : 'Add profile picture'}</button>
+        ${state.user.avatar_url ? '<button class="secondary-button profile-remove-button" type="button" data-action="remove-profile-picture">Remove profile picture</button>' : ''}
         <p class="profile-picture-guidance">Recommended: a square image, at least 256 x 256 px. JPEG, PNG, GIF, or WEBP; maximum 5 MB. Other image dimensions are fitted automatically.</p>
         <input id="profile-picture-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
       </section>
@@ -1021,6 +1360,15 @@ function renderGroupMembersModal(conversation) {
         <button class="modal-close" type="button" data-action="close-modal" aria-label="Close group members">×</button>
         <h2 id="group-modal-title">${isCreator ? 'Manage group members' : 'Group members'}</h2>
         <p class="modal-subtitle">${escapeHtml(conversation.name || 'Group')} · ${members.length} members</p>
+        <div class="group-icon-editor">
+          ${conversationAvatar(conversation, 'lg')}
+          <div class="group-icon-actions">
+            <button class="small-button" type="button" data-action="choose-group-icon">${conversation.icon_url ? 'Change group icon' : 'Add group icon'}</button>
+            ${conversation.icon_url ? `<button class="secondary-button" type="button" data-action="remove-group-icon" data-id="${escapeHtml(conversation.id)}">Remove</button>` : ''}
+            <span class="group-icon-hint">JPEG, PNG, GIF or WEBP, up to 5 MB. Everyone in the group sees it.</span>
+          </div>
+          <input id="group-icon-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" data-conversation-id="${escapeHtml(conversation.id)}" hidden>
+        </div>
         <div class="modal-member-list">
           ${members.map((member) => `
             <div class="modal-member-row">
@@ -1090,16 +1438,32 @@ async function handleForwardMessage(form) {
 
   const message = state.messages.find((item) => String(item.id) === String(messageId));
   if (!message) throw new Error('This message is no longer available.');
+  if (message.decryption_failed) throw new Error('This message could not be decrypted, so it cannot be forwarded.');
   const submitButton = form.querySelector('button[type="submit"]');
   submitButton.disabled = true;
   submitButton.textContent = `Forwarding to ${selectedTargets.length}…`;
 
   const results = await Promise.allSettled(selectedTargets.map(async (checkbox) => {
     const targetConversationId = checkbox.value;
-    const forwardedMessage = await api(
-      `/conversations/${encodeURIComponent(sourceConversationId)}/messages/${encodeURIComponent(messageId)}/forward`,
-      { method: 'POST', body: { target_conversation_id: Number(targetConversationId) } },
-    );
+    const forwardPath = `/conversations/${encodeURIComponent(sourceConversationId)}/messages/${encodeURIComponent(messageId)}/forward`;
+    // The server cannot read encrypted content, so it is re-encrypted here for the
+    // target conversation. A file keeps its own key, so its bytes are copied as-is.
+    const content = message.attachment?.fileKey
+      ? {
+        text: message.body || null,
+        file: {
+          name: message.attachment.name,
+          mime: message.attachment.mime,
+          size: message.attachment.size,
+          key: message.attachment.fileKey,
+          iv: message.attachment.fileIv,
+        },
+      }
+      : message.type === 'protected' || message.attachment ? null : { text: message.body };
+    const forwardedMessage = content
+      ? await sendEncrypted(targetConversationId, content, (encrypted) =>
+        api(forwardPath, { method: 'POST', body: { target_conversation_id: Number(targetConversationId), ...encrypted } }))
+      : await api(forwardPath, { method: 'POST', body: { target_conversation_id: Number(targetConversationId) } });
     await notifyMessageSent(targetConversationId, forwardedMessage.id);
     checkbox.checked = false;
     return targetConversationId;
@@ -1375,16 +1739,640 @@ function playRemoteMedia(element) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Message requests, blocked chats, and pinned messages
+// ---------------------------------------------------------------------------
+
+// Blocked chats, and requests the other person declined, can be read but not written to.
+function isReadOnly(conversation) {
+  return Boolean(conversation?.blocked ||
+    (conversation?.request?.status === 'declined' && !conversation.request.incoming));
+}
+
+function conversationTag(conversation) {
+  if (conversation?.blocked) return '<span class="chat-tag blocked">Blocked</span>';
+  if (conversation?.request?.status === 'pending') {
+    return conversation.request.incoming
+      ? '<span class="chat-tag request">Message request</span>'
+      : '<span class="chat-tag">Request sent</span>';
+  }
+  return '';
+}
+
+function renderChatBanner() {
+  const banner = document.querySelector('#chat-banner');
+  const wrap = document.querySelector('.composer-wrap');
+  const conversation = selectedConversation();
+  if (!banner || !wrap || !conversation) return;
+  const name = escapeHtml(conversation.friend?.name || 'This person');
+  const friendId = escapeHtml(conversation.friend?.id);
+  const conversationId = escapeHtml(conversation.id);
+  const button = (action, label, id, extra = '') =>
+    `<button class="small-button${extra}" type="button" data-action="${action}" data-id="${id}">${label}</button>`;
+
+  let text = '';
+  const actions = [];
+  if (conversation.blocked === 'by_me') {
+    text = `You blocked ${name}. You can still read your old messages, but neither of you can send new ones.`;
+    actions.push(button('unblock-user', 'Unblock', friendId));
+  } else if (conversation.blocked === 'by_them') {
+    text = `You can't send messages to ${name}. You can still read your old messages.`;
+  } else if (conversation.request?.status === 'pending' && conversation.request.incoming) {
+    text = `${name} is not in your friends and wants to message you. Replying also accepts.`;
+    actions.push(
+      button('accept-request', 'Accept', conversationId),
+      button('decline-request', 'Decline', conversationId),
+      button('block-user', 'Block', friendId, ' danger'),
+    );
+  } else if (conversation.request?.status === 'pending') {
+    text = `Message request sent. ${name} will see your messages as a request until they accept.`;
+  } else if (conversation.request?.status === 'declined') {
+    text = `${name} declined your message request.`;
+  } else if (isOthersConversation(conversation)) {
+    text = `${name} is not in your friends. Add them to move this chat to Chats.`;
+  }
+  // Any chat with a non-friend (not blocked) can be turned into a friendship.
+  if (isOthersConversation(conversation) && !conversation.blocked && conversation.friend?.phone &&
+    conversation.request?.status !== 'declined') {
+    actions.unshift(`<button class="small-button" type="button" data-action="add-friend-from-chat" data-phone="${escapeHtml(conversation.friend.phone)}">Add friend</button>`);
+  }
+
+  banner.innerHTML = text
+    ? `<span>${text}</span>${actions.length ? `<span class="chat-banner-actions">${actions.join('')}</span>` : ''}`
+    : '';
+  banner.hidden = !text;
+  wrap.classList.toggle('read-only', isReadOnly(conversation));
+}
+
+function canPinMessage(message) {
+  return !message.pending && !message.deleted_for_everyone_at && message.type !== 'call' &&
+    !isReadOnly(selectedConversation());
+}
+
+function renderPinnedBar() {
+  const bar = document.querySelector('#pinned-bar');
+  if (!bar) return;
+  const pins = state.pinnedMessages;
+  if (!pins.length) {
+    bar.hidden = true;
+    bar.replaceChildren();
+    return;
+  }
+  const index = Math.min(state.pinIndex, pins.length - 1);
+  const pin = pins[index];
+  bar.hidden = false;
+  bar.innerHTML = `
+    <span class="pinned-icon" aria-hidden="true">📌</span>
+    <button class="pinned-text" type="button" data-action="jump-to-pin" data-message-id="${escapeHtml(pin.id)}" title="Go to pinned message">
+      <strong>${pins.length > 1 ? `Pinned message ${index + 1} of ${pins.length}` : 'Pinned message'}</strong>
+      <span>${escapeHtml(`${pin.sender?.name ? `${pin.sender.name}: ` : ''}${messageSummary(pin)}`)}</span>
+    </button>
+    ${isReadOnly(selectedConversation()) ? '' : `<button class="pinned-unpin" type="button" data-action="toggle-pin" data-message-id="${escapeHtml(pin.id)}" aria-label="Unpin this message" title="Unpin">×</button>`}`;
+}
+
+// ---------------------------------------------------------------------------
+// Message search
+//
+// Messages are end-to-end encrypted, so the server cannot search them. The
+// app downloads and decrypts a chat's history into a local, in-memory index
+// (cleared on sign-out) and searches that. Later searches only fetch what is new.
+// ---------------------------------------------------------------------------
+
+const SEARCH_PAGE_SIZE = 100;
+// Searching all chats looks through this many recent messages per chat;
+// searching inside one chat goes through its whole history.
+const GLOBAL_SEARCH_MESSAGES_PER_CHAT = 500;
+const MAX_SEARCH_RESULTS = 200;
+
+function searchableText(message) {
+  if (!message || message.deleted_for_everyone_at || message.decryption_failed) return '';
+  if (message.type === 'protected' || message.type === 'call') return '';
+  return [message.body, message.attachment?.name].filter(Boolean).join(' ').trim();
+}
+
+function searchIndexFor(conversationId) {
+  const key = String(conversationId);
+  if (!state.searchIndex.has(key)) {
+    state.searchIndex.set(key, { items: new Map(), started: false, newestId: 0, oldestId: Infinity, scanned: 0, complete: false, queue: Promise.resolve() });
+  }
+  return state.searchIndex.get(key);
+}
+
+function addToSearchIndex(conversationId, messages) {
+  const index = searchIndexFor(conversationId);
+  for (const message of messages || []) {
+    const id = Number(message?.id);
+    if (message?.pending || !Number.isFinite(id)) continue;
+    const text = searchableText(message);
+    if (text) {
+      index.items.set(id, { id, conversationId: String(conversationId), text, lower: text.toLowerCase(), sender: message.sender, created_at: message.created_at });
+    } else {
+      index.items.delete(id);
+    }
+  }
+}
+
+async function fetchSearchPage(conversationId, beforeId) {
+  const query = beforeId ? `before_id=${beforeId}&limit=${SEARCH_PAGE_SIZE}` : `limit=${SEARCH_PAGE_SIZE}`;
+  const payload = await api(`/conversations/${encodeURIComponent(conversationId)}/messages?${query}`);
+  const messages = await decryptMessagesForDisplay(conversationId, Array.isArray(payload.data) ? payload.data : []);
+  addToSearchIndex(conversationId, messages);
+  const ids = messages.map((message) => Number(message.id)).filter(Number.isFinite);
+  return {
+    newest: ids.length ? Math.max(...ids) : 0,
+    oldest: ids.length ? Math.min(...ids) : Infinity,
+    count: messages.length,
+    hasMore: Boolean(payload.has_more),
+  };
+}
+
+// Brings a chat's index up to date (new messages first), then indexes older
+// history until `limit` messages were scanned or the chat's start is reached.
+// Runs are queued per chat and can stop early; the next run resumes.
+function indexConversation(conversationId, limit, isCancelled, onProgress) {
+  const index = searchIndexFor(conversationId);
+  const run = async () => {
+    const key = String(conversationId);
+    const latestId = Number(state.conversations.find((item) => String(item.id) === key)?.last_message?.id) || 0;
+    if (!index.started) {
+      const page = await fetchSearchPage(key, null);
+      index.started = true;
+      index.newestId = page.newest;
+      index.oldestId = page.oldest;
+      index.scanned = page.count;
+      index.complete = !page.hasMore;
+      onProgress?.();
+    } else if (latestId > index.newestId) {
+      // Catch up on messages that arrived since the index was built.
+      let beforeId = null;
+      let newest = index.newestId;
+      for (let pages = 0; pages < 50; pages += 1) {
+        const page = await fetchSearchPage(key, beforeId);
+        newest = Math.max(newest, page.newest);
+        if (!page.hasMore || page.oldest <= index.newestId) break;
+        beforeId = page.oldest;
+      }
+      index.newestId = newest;
+      onProgress?.();
+    }
+    while (!index.complete && index.scanned < limit && Number.isFinite(index.oldestId)) {
+      if (isCancelled?.()) return;
+      const page = await fetchSearchPage(key, index.oldestId);
+      index.oldestId = Math.min(index.oldestId, page.oldest);
+      index.scanned += page.count;
+      index.complete = !page.hasMore || page.count === 0;
+      onProgress?.();
+    }
+  };
+  index.queue = index.queue.catch(() => {}).then(run);
+  return index.queue;
+}
+
+function searchIndexedMessages(query, conversationIds) {
+  const needle = query.trim().toLowerCase();
+  const results = [];
+  for (const id of conversationIds) {
+    const index = state.searchIndex.get(String(id));
+    if (!index) continue;
+    for (const item of index.items.values()) {
+      if (item.lower.includes(needle)) results.push(item);
+    }
+  }
+  return results.sort((left, right) => right.id - left.id);
+}
+
+function searchSnippet(text, needle) {
+  const at = text.toLowerCase().indexOf(needle);
+  if (at < 0) return escapeHtml(text.slice(0, 120));
+  const start = Math.max(0, at - 40);
+  const end = Math.min(text.length, at + needle.length + 80);
+  return `${start > 0 ? '…' : ''}${escapeHtml(text.slice(start, at))}<mark>${escapeHtml(text.slice(at, at + needle.length))}</mark>${escapeHtml(text.slice(at + needle.length, end))}${end < text.length ? '…' : ''}`;
+}
+
+function searchResultDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) return formattedTime(value);
+  return new Intl.DateTimeFormat(undefined, {
+    day: 'numeric',
+    month: 'short',
+    ...(date.getFullYear() === now.getFullYear() ? {} : { year: 'numeric' }),
+  }).format(date);
+}
+
+function searchResultMarkup(item, needle, showChat) {
+  const conversation = state.conversations.find((entry) => String(entry.id) === item.conversationId);
+  const sender = String(item.sender?.id) === String(state.user?.id) ? 'You' : (item.sender?.name || 'Someone');
+  return `
+    <button class="search-result" type="button" data-action="open-search-result" data-conversation-id="${escapeHtml(item.conversationId)}" data-message-id="${escapeHtml(item.id)}">
+      ${showChat ? `<span class="search-result-chat">${escapeHtml(conversationTitle(conversation))}</span>` : ''}
+      <span class="search-result-meta"><span>${escapeHtml(sender)}</span><span>${escapeHtml(searchResultDate(item.created_at))}</span></span>
+      <span class="search-result-text">${searchSnippet(item.text, needle)}</span>
+    </button>`;
+}
+
+function resultCountText(count) {
+  if (count > MAX_SEARCH_RESULTS) return `Showing the newest ${MAX_SEARCH_RESULTS} of ${count} results`;
+  return `${count} ${count === 1 ? 'result' : 'results'}`;
+}
+
+// --- Search inside the open chat ---
+
+let chatSearchTimer = null;
+
+function openChatSearch() {
+  const conversation = selectedConversation();
+  if (!conversation) return;
+  if (state.chatSearch.conversationId !== String(conversation.id)) {
+    state.chatSearch = { open: true, conversationId: String(conversation.id), query: '', status: '', html: '' };
+  } else {
+    state.chatSearch.open = true;
+  }
+  renderChatSearch(true);
+}
+
+function closeChatSearch() {
+  state.chatSearch = { open: false, conversationId: null, query: '', status: '', html: '' };
+  state.chatSearchToken += 1;
+  renderChatSearch(false);
+}
+
+function renderChatSearch(focus = false) {
+  const box = document.querySelector('#chat-search');
+  if (!box) return;
+  const search = state.chatSearch;
+  if (search.open && search.conversationId !== String(state.selectedConversationId)) {
+    state.chatSearch = { open: false, conversationId: null, query: '', status: '', html: '' };
+    state.chatSearchToken += 1;
+  }
+  if (!state.chatSearch.open) {
+    box.hidden = true;
+    box.replaceChildren();
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = `
+    <div class="chat-search-bar">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20.5 20.5-4.5-4.5"/></svg>
+      <input id="chat-search-input" type="search" value="${escapeHtml(search.query)}" placeholder="Search messages in this chat" aria-label="Search messages in this chat" autocomplete="off">
+      <span class="chat-search-status" id="chat-search-status" aria-live="polite">${escapeHtml(search.status)}</span>
+      <button class="icon-button" type="button" data-action="close-chat-search" title="Close search (Esc)" aria-label="Close search">×</button>
+    </div>
+    <div class="chat-search-results" id="chat-search-results" ${search.html ? '' : 'hidden'}>${search.html}</div>`;
+  if (focus) {
+    const input = box.querySelector('#chat-search-input');
+    input?.focus();
+    input?.setSelectionRange(input.value.length, input.value.length);
+  }
+}
+
+function showChatSearchResults(token, query, conversationId) {
+  if (token !== state.chatSearchToken) return;
+  const needle = query.toLowerCase();
+  const results = searchIndexedMessages(query, [conversationId]);
+  const index = searchIndexFor(conversationId);
+  const searching = !index.complete;
+  state.chatSearch.status = `${resultCountText(results.length)}${searching ? ' · searching older messages…' : ''}`;
+  state.chatSearch.html = results.length
+    ? results.slice(0, MAX_SEARCH_RESULTS).map((item) => searchResultMarkup(item, needle, false)).join('')
+    : searching ? '' : '<div class="empty-list">No messages found.</div>';
+  const status = document.querySelector('#chat-search-status');
+  if (status) status.textContent = state.chatSearch.status;
+  const resultsBox = document.querySelector('#chat-search-results');
+  if (resultsBox) {
+    resultsBox.innerHTML = state.chatSearch.html;
+    resultsBox.hidden = !state.chatSearch.html;
+  }
+}
+
+async function runChatSearch() {
+  const conversation = selectedConversation();
+  const token = ++state.chatSearchToken;
+  const query = state.chatSearch.query.trim();
+  if (!conversation || !state.chatSearch.open || query.length < 2) {
+    state.chatSearch.status = query.length === 1 ? 'Type at least 2 characters' : '';
+    state.chatSearch.html = '';
+    renderChatSearch(document.activeElement?.id === 'chat-search-input');
+    return;
+  }
+  const conversationId = String(conversation.id);
+  addToSearchIndex(conversationId, state.messages);
+  showChatSearchResults(token, query, conversationId);
+  try {
+    await indexConversation(conversationId, Infinity, () => token !== state.chatSearchToken,
+      () => showChatSearchResults(token, query, conversationId));
+  } catch (error) {
+    if (token !== state.chatSearchToken) return;
+    state.chatSearch.status = `Search stopped: ${error.message}`;
+    const status = document.querySelector('#chat-search-status');
+    if (status) status.textContent = state.chatSearch.status;
+    return;
+  }
+  showChatSearchResults(token, query, conversationId);
+}
+
+function scheduleChatSearch() {
+  clearTimeout(chatSearchTimer);
+  chatSearchTimer = setTimeout(() => void runChatSearch(), 250);
+}
+
+// --- Search across all chats (sidebar search) ---
+
+let globalSearchTimer = null;
+
+function globalSearchMarkup() {
+  return `
+    <div class="search-section-title">Messages</div>
+    <div class="global-search-status" id="global-search-status" aria-live="polite">${escapeHtml(state.globalSearch.status)}</div>
+    <div class="global-message-results" id="global-message-results">${state.globalSearch.html}</div>`;
+}
+
+function showGlobalSearchResults(token, query, conversationIds, scanned) {
+  if (token !== state.globalSearchToken) return;
+  const done = scanned >= conversationIds.length;
+  const results = searchIndexedMessages(query, conversationIds);
+  state.globalSearch.status = done
+    ? resultCountText(results.length)
+    : `Searching messages… (${scanned} of ${conversationIds.length} chats)`;
+  state.globalSearch.html = results.length
+    ? results.slice(0, MAX_SEARCH_RESULTS).map((item) => searchResultMarkup(item, query.toLowerCase(), true)).join('')
+    : done ? '<div class="empty-list">No messages found.</div>' : '';
+  const status = document.querySelector('#global-search-status');
+  if (status) status.textContent = state.globalSearch.status;
+  const box = document.querySelector('#global-message-results');
+  if (box) box.innerHTML = state.globalSearch.html;
+}
+
+async function runGlobalSearch(query) {
+  const token = ++state.globalSearchToken;
+  const conversationIds = sortConversationsByLatest(state.conversations).map((conversation) => String(conversation.id));
+  if (state.selectedConversationId) addToSearchIndex(state.selectedConversationId, state.messages);
+  showGlobalSearchResults(token, query, conversationIds, 0);
+  let scanned = 0;
+  for (const conversationId of conversationIds) {
+    if (token !== state.globalSearchToken) return;
+    try {
+      await indexConversation(conversationId, GLOBAL_SEARCH_MESSAGES_PER_CHAT, () => token !== state.globalSearchToken);
+    } catch {
+      // A chat that cannot be read right now is skipped; the others still count.
+    }
+    scanned += 1;
+    showGlobalSearchResults(token, query, conversationIds, scanned);
+  }
+}
+
+// Called whenever the chat list renders while searching; only a changed
+// query starts a new search.
+function scheduleGlobalSearch(query) {
+  if (state.globalSearch.query === query) return;
+  state.globalSearch = { query, status: query.length < 2 ? '' : 'Searching messages…', html: '' };
+  state.globalSearchToken += 1;
+  clearTimeout(globalSearchTimer);
+  if (query.length < 2) return;
+  globalSearchTimer = setTimeout(() => void runGlobalSearch(query), 300);
+}
+
+async function openSearchResult(conversationId, messageId) {
+  if (String(state.selectedConversationId) !== String(conversationId)) {
+    const conversation = state.conversations.find((item) => String(item.id) === String(conversationId));
+    if (!conversation) throw new Error('This chat is no longer available.');
+    const tool = state.sidebarTool;
+    if (conversation.type === 'group') await openGroupConversation(conversation.id);
+    else await openFriend(conversation.friend?.id);
+    // Keep the search results open so the next result is one click away.
+    if (tool === 'search' && !state.sidebarTool) {
+      state.sidebarTool = 'search';
+      renderSidebar();
+    }
+  }
+  await jumpToMessage(messageId);
+}
+
+// Scrolls to a message, loading older pages if it is further back in the chat.
+async function jumpToMessage(messageId) {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const row = document.querySelector(`[data-message-row="${CSS.escape(String(messageId))}"]`);
+    if (row) {
+      row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      row.classList.add('highlight');
+      setTimeout(() => row.classList.remove('highlight'), 1600);
+      return;
+    }
+    if (!state.hasOlderMessages) break;
+    await loadOlderMessages();
+  }
+  showNotice('That message is no longer available.');
+}
+
+// ---------------------------------------------------------------------------
+// Realtime pushes from the API
+//
+// The API pushes changes the moment they happen, with the message itself, so
+// they show up without another request. Anything unexpected falls back to a refresh.
+// ---------------------------------------------------------------------------
+
+async function handleMessagePush(event, payload) {
+  const conversationId = String(payload?.conversation_id || '');
+  if (!conversationId || !payload?.message?.id) return;
+  if (!state.conversations.some((conversation) => String(conversation.id) === conversationId)) {
+    void refreshData();
+    return;
+  }
+  const message = await decryptForDisplay(conversationId, payload.message);
+  const fromOther = String(message.sender?.id) !== String(state.user?.id);
+  const isOpen = String(state.selectedConversationId) === conversationId;
+
+  if (event === 'message.updated') {
+    const replace = (item) => String(item.id) === String(message.id) ? message : item;
+    if (isOpen) {
+      state.messages = state.messages.map(replace);
+      state.pinnedMessages = state.pinnedMessages.map(replace);
+      renderMessages();
+    }
+    state.conversations = state.conversations.map((conversation) =>
+      String(conversation.id) === conversationId && String(conversation.last_message?.id) === String(message.id)
+        ? { ...conversation, last_message: message }
+        : conversation);
+    renderFriendList();
+    return;
+  }
+
+  if (isOpen) {
+    const alreadyShown = state.messages.some((item) => String(item.id) === String(message.id)) ||
+      [...state.outgoing.values()].some((entry) => String(entry.message.id) === String(message.id));
+    // This device's own send is shown by its own request; skip the echo meanwhile.
+    const ownSendInFlight = !fromOther && [...state.outgoing.values()].some((entry) =>
+      !entry.confirmed && String(entry.conversationId) === conversationId);
+    if (!alreadyShown && !ownSendInFlight) {
+      state.messages = [message, ...state.messages];
+      renderMessages();
+      void cacheMessageImages(conversationId, [message]);
+    }
+  }
+
+  const readingNow = isOpen && document.hasFocus();
+  state.conversations = sortConversationsByLatest(state.conversations.map((conversation) => {
+    if (String(conversation.id) !== conversationId) return conversation;
+    const newer = !conversation.last_message || Number(message.id) >= Number(conversation.last_message.id);
+    return {
+      ...conversation,
+      last_message: newer ? message : conversation.last_message,
+      updated_at: newer ? message.created_at : conversation.updated_at,
+      unread_count: fromOther && !readingNow ? (Number(conversation.unread_count) || 0) + 1 : conversation.unread_count,
+    };
+  }));
+  renderFriendList();
+  syncUnreadIndicators();
+
+  if (fromOther && readingNow) {
+    void api(`/conversations/${encodeURIComponent(conversationId)}/read`, { method: 'POST' })
+      .then(() => announceRead(conversationId))
+      .catch(() => {});
+  }
+  if (fromOther && message.type === 'call' && message.call?.status === 'missed') void loadMissedCallBadge();
+}
+
+function handleReadPush(payload) {
+  const conversation = selectedConversation();
+  if (!conversation || String(payload?.conversation_id) !== String(conversation.id)) return;
+  const people = [...(conversation.participants || []), conversation.friend, state.user];
+  const user = people.find((person) => String(person?.id) === String(payload.user_id));
+  if (!user) return;
+  state.readCursors = [
+    ...state.readCursors.filter((cursor) => String(cursor.user?.id) !== String(payload.user_id)),
+    {
+      user: { id: user.id, name: user.name, avatar_url: user.avatar_url },
+      last_read_message_id: Number(payload.last_read_message_id),
+      read_at: payload.read_at,
+    },
+  ];
+  renderMessages();
+}
+
+// ---------------------------------------------------------------------------
+// Missed calls badge
+// ---------------------------------------------------------------------------
+
+function missedCallSeenKey() {
+  return `pitbconnect.lastSeenMissedCall.${state.user?.id}`;
+}
+
+function updateMissedCallBadge(count) {
+  const badge = document.querySelector('#missed-call-count');
+  if (!badge) return;
+  badge.textContent = count ? String(count) : '';
+  badge.hidden = !count;
+  badge.title = count ? `${count} new missed ${count === 1 ? 'call' : 'calls'}` : '';
+}
+
+async function loadMissedCallBadge() {
+  if (!state.token || !state.user) return;
+  try {
+    const result = await api('/call-history?filter=missed');
+    const calls = Array.isArray(result.data) ? result.data : [];
+    state.latestMissedCallId = calls.reduce((latest, call) => Math.max(latest, Number(call.id) || 0), 0);
+    let lastSeen = Number(localStorage.getItem(missedCallSeenKey()));
+    if (!Number.isFinite(lastSeen) || localStorage.getItem(missedCallSeenKey()) === null) {
+      // First run: earlier missed calls are not "new".
+      lastSeen = state.latestMissedCallId;
+      localStorage.setItem(missedCallSeenKey(), String(lastSeen));
+    }
+    updateMissedCallBadge(state.sidebarTool === 'calls' ? 0 : calls.filter((call) => Number(call.id) > lastSeen).length);
+    if (state.sidebarTool === 'calls') markMissedCallsSeen();
+  } catch {
+    // The badge is a convenience; call history itself still works.
+  }
+}
+
+function markMissedCallsSeen() {
+  if (!state.user) return;
+  localStorage.setItem(missedCallSeenKey(), String(state.latestMissedCallId));
+  updateMissedCallBadge(0);
+}
+
+// ---------------------------------------------------------------------------
+// Read receipts
+//
+// The API reports how far each member has read. A message shows blue ticks once
+// every other member has read it, and each member's photo sits under the newest
+// message they have seen (hover it for their name and when they read it).
+// ---------------------------------------------------------------------------
+
+function hasUnreadFromOthers() {
+  const mine = state.readCursors.find((cursor) => String(cursor.user?.id) === String(state.user?.id));
+  const lastRead = Number(mine?.last_read_message_id) || 0;
+  return state.messages.some((message) => !message.pending &&
+    String(message.sender?.id) !== String(state.user.id) &&
+    // Without a read position yet (older chats), fall back to the message's read time.
+    (mine ? Number(message.id) > lastRead : !message.read_at));
+}
+
+function announceRead(conversationId) {
+  return window.chatSocket?.notifyRead?.(conversationId).catch(() => false);
+}
+
+function otherMembers(message) {
+  const conversation = selectedConversation();
+  if (!conversation) return [];
+  const members = conversation.type === 'group' ? conversation.participants || [] : [conversation.friend];
+  return members.filter((member) => member?.id && String(member.id) !== String(message.sender?.id));
+}
+
+function readStatus(message) {
+  const members = otherMembers(message);
+  const readers = new Set(state.readCursors
+    .filter((cursor) => Number(cursor.last_read_message_id) >= Number(message.id))
+    .map((cursor) => String(cursor.user?.id)));
+  if (members.length && members.every((member) => readers.has(String(member.id)))) return 'read';
+  // Older direct chats may only have the message's own read time.
+  if (!members.length || selectedConversation()?.type !== 'group') {
+    if (message.read_at) return 'read';
+  }
+  return message.read_at || message.delivered_at ? 'delivered' : 'sent';
+}
+
+// Maps message id -> members whose newest seen message it is (excluding me).
+function seenByMarkers() {
+  const markers = new Map();
+  const confirmed = state.messages.filter((message) => !message.pending);
+  for (const cursor of state.readCursors) {
+    if (!cursor.user?.id || String(cursor.user.id) === String(state.user?.id)) continue;
+    const lastRead = Number(cursor.last_read_message_id);
+    const message = confirmed.find((item) => Number(item.id) <= lastRead &&
+      String(item.sender?.id) !== String(cursor.user.id));
+    if (!message) continue;
+    const key = String(message.id);
+    if (!markers.has(key)) markers.set(key, []);
+    markers.get(key).push(cursor);
+  }
+  return markers;
+}
+
+function seenByMarkup(cursors, alignEnd) {
+  if (!cursors?.length) return '';
+  const names = cursors.map((cursor) => cursor.user.name).join(', ');
+  return `<div class="seen-by${alignEnd ? ' mine' : ''}" aria-label="Seen by ${escapeHtml(names)}">
+      ${cursors.map((cursor) => {
+        const label = `Seen by ${cursor.user.name}${cursor.read_at ? ` · ${formattedTime(cursor.read_at)}` : ''}`;
+        return `<span class="seen-avatar" tabindex="0" data-name="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${avatarMarkup(cursor.user, 'seen')}</span>`;
+      }).join('')}
+    </div>`;
+}
+
 function renderMessages() {
   const list = document.querySelector('#message-list');
   if (!list) return;
   const wasNearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
   if (!state.messages.length) {
-    list.innerHTML = '<div class="empty-list chat-empty">Say hello and start the conversation.</div>';
+    list.innerHTML = state.messagesLoading
+      ? '<div class="empty-list chat-empty">Loading messages…</div>'
+      : '<div class="empty-list chat-empty">Say hello and start the conversation.</div>';
     return;
   }
 
   const orderedMessages = [...state.messages].reverse();
+  const seenBy = seenByMarkers();
   let lastDay = '';
   list.innerHTML = orderedMessages.map((message) => {
     const isMine = String(message.sender?.id) === String(state.user.id);
@@ -1396,7 +2384,7 @@ function renderMessages() {
       lastDay = day;
     }
     if (message.type === 'call' && message.call) {
-      const missed = message.call.status === 'missed';
+      const missed = message.call.status === 'missed' && !isMine;
       const title = messagePreview(message);
       const icon = missed ? '↙' : (isMine ? '↗' : '↙');
       return `${divider}
@@ -1406,10 +2394,18 @@ function renderMessages() {
             <strong>${escapeHtml(title)}</strong>
             <time>${formattedTime(message.created_at)}</time>
           </span>
-        </div>`;
+        </div>
+        ${seenByMarkup(seenBy.get(String(message.id)), isMine)}`;
     }
-    const receipt = !isDeleted && isMine
-      ? `<span class="message-receipt${message.read_at ? ' seen' : ''}" aria-label="${message.read_at ? 'Seen' : message.delivered_at ? 'Delivered' : 'Sent'}" title="${message.read_at ? 'Seen' : message.delivered_at ? 'Delivered' : 'Sent'}">${message.read_at || message.delivered_at ? '✓✓' : '✓'}</span>`
+    const receipt = message.pending
+      ? '<span class="message-receipt pending" aria-label="Sending" title="Sending">🕓</span>'
+      : !isDeleted && isMine
+      ? (() => {
+        const status = readStatus(message);
+        const group = selectedConversation()?.type === 'group';
+        const label = status === 'read' ? (group ? 'Read by everyone' : 'Read') : status === 'delivered' ? 'Delivered' : 'Sent';
+        return `<span class="message-receipt ${status}" aria-label="${label}" title="${label}">${status === 'sent' ? '✓' : '✓✓'}</span>`;
+      })()
       : '';
     const cacheKey = attachmentCacheKey(message.conversation_id, message.id);
     const imagePreview = message.attachment && CACHED_IMAGE_TYPES.has(message.attachment.mime)
@@ -1430,13 +2426,17 @@ function renderMessages() {
       : '';
     const imageWithCaption = message.attachment && CACHED_IMAGE_TYPES.has(message.attachment.mime);
     const inlineTextFooter = !isDeleted && Boolean(message.body) && !message.attachment;
-    const messageFooter = `<div class="message-foot"><span>${formattedTime(message.created_at)}${receipt ? ` ${receipt}` : ''}</span></div>`;
+    const editedLabel = message.edited_at && !isDeleted
+      ? `<span class="message-edited" title="Edited ${escapeHtml(formattedTime(message.edited_at))}">edited</span> `
+      : '';
+    const pinnedLabel = message.pinned_at && !isDeleted ? '<span class="message-pinned" title="Pinned">📌</span> ' : '';
+    const messageFooter = `<div class="message-foot"><span>${pinnedLabel}${editedLabel}${formattedTime(message.created_at)}${receipt ? ` ${receipt}` : ''}</span></div>`;
     const replyPreview = message.reply_to
       ? `<div class="message-quote"><strong>${escapeHtml(message.reply_to.sender?.name || 'Message')}</strong><span>${escapeHtml(messageSummary(message.reply_to))}</span></div>`
       : '';
     const forwardedLabel = message.is_forwarded ? '<div class="message-forwarded">↗ Forwarded</div>' : '';
     return `${divider}
-      <div class="message-row ${isMine ? 'mine' : ''}">
+      <div class="message-row ${isMine ? 'mine' : ''}" data-message-row="${escapeHtml(message.id)}">
         ${isMine ? '' : messageAvatar(message)}
         <div class="message-bubble">
           ${forwardedLabel}
@@ -1447,10 +2447,12 @@ function renderMessages() {
           ${inlineTextFooter
             ? `<div class="message-content">${bodyMarkup}${messageFooter}</div>`
             : imageWithCaption ? `${imageMarkup}${bodyMarkup}${attachmentMarkup}` : `${bodyMarkup}${imageMarkup}${attachmentMarkup}`}
-          ${!isDeleted ? `<details class="message-menu ${isMine ? 'mine' : 'other'}">
+          ${!isDeleted && !message.pending ? `<details class="message-menu ${isMine ? 'mine' : 'other'}">
             <summary aria-label="Message options" title="Message options">⋯</summary>
             <div class="message-menu-items" role="menu" aria-label="Message options">
               <button type="button" role="menuitem" data-action="reply-message" data-message-id="${escapeHtml(message.id)}">↩ <span>Reply</span></button>
+              ${canPinMessage(message) ? `<button type="button" role="menuitem" data-action="toggle-pin" data-message-id="${escapeHtml(message.id)}">📌 <span>${message.pinned_at ? 'Unpin' : 'Pin'}</span></button>` : ''}
+              ${canEditMessage(message) ? `<button type="button" role="menuitem" data-action="edit-message" data-message-id="${escapeHtml(message.id)}">✎ <span>Edit</span></button>` : ''}
               <button type="button" role="menuitem" data-action="forward-message" data-message-id="${escapeHtml(message.id)}">↗ <span>Forward</span></button>
               ${isVoice || (isProtected && !state.unlockedMessages.has(String(message.id))) ? '' : `<button type="button" role="menuitem" data-action="copy-message" data-message-id="${escapeHtml(message.id)}">⧉ <span>Copy message</span></button>`}
               <button type="button" role="menuitem" data-action="delete-message-for-me" data-message-id="${escapeHtml(message.id)}">⌫ <span>Delete for me</span></button>
@@ -1459,10 +2461,58 @@ function renderMessages() {
           </details>` : ''}
           ${inlineTextFooter ? '' : messageFooter}
         </div>
-      </div>`;
+      </div>
+      ${seenByMarkup(seenBy.get(String(message.id)), isMine)}`;
   }).join('');
+  list.insertAdjacentHTML('afterbegin', state.hasOlderMessages
+    ? `<div class="history-loader" id="history-loader" aria-live="polite">${state.loadingOlderMessages ? 'Loading earlier messages…' : ''}</div>`
+    : '<div class="history-start">Start of conversation</div>');
   updateVoiceViews();
+  renderPinnedBar();
   if (wasNearBottom) list.scrollTop = list.scrollHeight;
+  // If the loaded messages do not fill the screen there is nothing to scroll, so
+  // fetch older ones straight away.
+  if (state.hasOlderMessages && !state.loadingOlderMessages && list.scrollHeight <= list.clientHeight + 40) {
+    void loadOlderMessages();
+  }
+}
+
+// Loads the page of messages just before the oldest one shown, keeping the
+// view anchored so the messages being read do not jump.
+async function loadOlderMessages() {
+  const conversation = selectedConversation();
+  if (!conversation || !state.hasOlderMessages || state.loadingOlderMessages) return;
+  const oldestId = state.messages.reduce((oldest, message) =>
+    message.pending ? oldest : Math.min(oldest, Number(message.id)), Infinity);
+  if (!Number.isFinite(oldestId)) return;
+
+  const conversationId = String(conversation.id);
+  state.loadingOlderMessages = true;
+  const loader = document.querySelector('#history-loader');
+  if (loader) loader.textContent = 'Loading earlier messages…';
+  try {
+    const payload = await api(
+      `/conversations/${encodeURIComponent(conversationId)}/messages?before_id=${oldestId}&limit=${MESSAGE_PAGE_SIZE}`,
+    );
+    if (String(state.selectedConversationId) !== conversationId) return;
+    const older = await decryptMessagesForDisplay(conversationId, Array.isArray(payload.data) ? payload.data : []);
+    if (String(state.selectedConversationId) !== conversationId) return;
+    const known = new Set(state.messages.map((message) => String(message.id)));
+    const list = document.querySelector('#message-list');
+    const distanceFromBottom = list ? list.scrollHeight - list.scrollTop : 0;
+    state.messages = [...state.messages, ...older.filter((message) => !known.has(String(message.id)))];
+    state.hasOlderMessages = Boolean(payload.has_more);
+    state.loadingOlderMessages = false;
+    renderMessages();
+    if (list) list.scrollTop = list.scrollHeight - distanceFromBottom;
+    void cacheMessageImages(conversationId, older);
+  } catch (error) {
+    showNotice(`Earlier messages could not be loaded: ${error.message}`);
+  } finally {
+    state.loadingOlderMessages = false;
+    const currentLoader = document.querySelector('#history-loader');
+    if (currentLoader) currentLoader.textContent = '';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1550,7 +2600,7 @@ async function toggleVoicePlayback(messageId) {
   try {
     let url = state.voiceBlobUrls.get(key);
     if (!url) {
-      const blob = await fetchAttachmentBlob(message.conversation_id, message.id);
+      const blob = await fetchAttachmentBlob(message.conversation_id, message);
       if (!blob.type.startsWith('audio/')) throw new Error('The voice message could not be verified.');
       url = URL.createObjectURL(blob);
       state.voiceBlobUrls.set(key, url);
@@ -1707,26 +2757,35 @@ async function finishVoiceRecording(send) {
   const conversationId = recording.conversationId;
   const replyTarget = String(state.selectedConversationId) === String(conversationId) ? state.replyTarget : null;
   const extension = baseType === 'audio/ogg' ? 'ogg' : 'webm';
-  const payload = new FormData();
-  payload.append('voice', new File([blob], `voice-message.${extension}`, { type: baseType }));
-  payload.append('voice_duration_seconds', String(Math.min(MAX_VOICE_SECONDS, Math.max(1, Math.round(elapsed / 1000)))));
-  if (replyTarget) payload.append('reply_to_message_id', replyTarget.id);
-
-  const sentMessage = await api(`/conversations/${encodeURIComponent(conversationId)}/messages`, {
-    method: 'POST',
-    body: payload,
-  });
+  const encryptedVoice = await encryptFileBytes(new Uint8Array(await blob.arrayBuffer()));
+  const voiceDetails = {
+    name: `voice-message.${extension}`,
+    mime: baseType,
+    size: blob.size,
+    key: encryptedVoice.key,
+    iv: encryptedVoice.iv,
+  };
+  const sentMessage = await decryptForDisplay(conversationId, await sendEncrypted(
+    conversationId,
+    { text: null, file: voiceDetails },
+    (encrypted) => {
+      const payload = new FormData();
+      payload.append('body', encrypted.body);
+      payload.append('encrypted', '1');
+      payload.append('key_version', String(encrypted.key_version));
+      payload.append('voice', new Blob([encryptedVoice.data], { type: 'application/octet-stream' }), 'encrypted.bin');
+      payload.append('voice_duration_seconds', String(Math.min(MAX_VOICE_SECONDS, Math.max(1, Math.round(elapsed / 1000)))));
+      if (replyTarget) payload.append('reply_to_message_id', replyTarget.id);
+      return api(`/conversations/${encodeURIComponent(conversationId)}/messages`, { method: 'POST', body: payload });
+    },
+  ));
   state.voiceBlobUrls.set(voiceKey(conversationId, sentMessage.id), URL.createObjectURL(blob));
-  await notifyMessageSent(conversationId, sentMessage.id);
   if (replyTarget && state.replyTarget === replyTarget) {
     state.replyTarget = null;
     updateReplyPreview();
   }
-  await refreshData();
-  const messageList = document.querySelector('#message-list');
-  if (messageList && String(state.selectedConversationId) === String(conversationId)) {
-    messageList.scrollTop = messageList.scrollHeight;
-  }
+  applySentMessage(conversationId, sentMessage);
+  void notifyMessageSent(conversationId, sentMessage.id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1915,8 +2974,8 @@ async function handleSendProtected(form) {
     });
     form.elements.secret.value = '';
     renderProtectedPasswordModal(password, conversationTitle(conversation));
-    await notifyMessageSent(conversationId, sentMessage.id);
-    await refreshData();
+    applySentMessage(conversationId, sentMessage);
+    void notifyMessageSent(conversationId, sentMessage.id);
   } finally {
     if (submitButton.isConnected) {
       submitButton.disabled = false;
@@ -1953,20 +3012,88 @@ async function handleUnlockProtected(form) {
 function updateReplyPreview() {
   const preview = document.querySelector('#reply-preview');
   if (!preview) return;
-  const message = state.replyTarget;
+  const editing = state.editTarget &&
+    String(state.editTarget.conversation_id) === String(state.selectedConversationId)
+    ? state.editTarget
+    : null;
+  const message = editing || state.replyTarget;
   preview.hidden = !message;
-  preview.innerHTML = message ? `
+  preview.classList.toggle('editing', Boolean(editing));
+  preview.innerHTML = editing ? `
+    <div class="reply-preview-content">
+      <strong>Editing message</strong>
+      <span>${escapeHtml(editing.body)}</span>
+    </div>
+    <button class="reply-preview-cancel" type="button" data-action="cancel-edit" aria-label="Cancel editing">×</button>`
+    : message ? `
     <div class="reply-preview-content">
       <strong>Replying to ${escapeHtml(message.sender?.name || 'message')}</strong>
       <span>${escapeHtml(messageSummary(message))}</span>
     </div>
     <button class="reply-preview-cancel" type="button" data-action="cancel-reply" aria-label="Cancel reply">×</button>` : '';
+  const sendButton = document.querySelector('#message-form .send-button');
+  if (sendButton) {
+    sendButton.textContent = editing ? '✓' : '➤';
+    sendButton.setAttribute('aria-label', editing ? 'Save edited message' : 'Send message');
+  }
 }
 
 function beginReply(message) {
+  if (state.editTarget) cancelEdit();
   state.replyTarget = message;
   updateReplyPreview();
   document.querySelector('#message-form textarea')?.focus();
+}
+
+function beginEdit(message) {
+  if (!canEditMessage(message)) {
+    throw new Error(`Messages can only be edited within ${messageEditMinutes()} minutes of sending.`);
+  }
+  state.replyTarget = null;
+  state.editTarget = message;
+  updateReplyPreview();
+  const field = document.querySelector('#message-form textarea');
+  if (field) {
+    field.value = message.body;
+    field.focus();
+    field.setSelectionRange(field.value.length, field.value.length);
+  }
+}
+
+function cancelEdit() {
+  if (!state.editTarget) return;
+  state.editTarget = null;
+  const field = document.querySelector('#message-form textarea');
+  if (field) field.value = '';
+  updateReplyPreview();
+}
+
+async function saveEditedMessage(message, field) {
+  const body = field.value.trim();
+  if (!body) throw new Error('The message cannot be empty. Use Delete to remove it instead.');
+  if (body === message.body) {
+    cancelEdit();
+    return;
+  }
+  const conversationId = message.conversation_id;
+  const updated = await decryptForDisplay(conversationId, await sendEncrypted(conversationId, { text: body }, (encrypted) => api(
+    `/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(message.id)}`,
+    { method: 'PATCH', body: encrypted },
+  )));
+  if (state.editTarget === message) {
+    state.editTarget = null;
+    field.value = '';
+    updateReplyPreview();
+  }
+  state.messages = state.messages.map((item) => String(item.id) === String(updated.id) ? updated : item);
+  state.conversations = state.conversations.map((conversation) =>
+    String(conversation.last_message?.id) === String(updated.id)
+      ? { ...conversation, last_message: updated }
+      : conversation);
+  renderMessages();
+  renderFriendList();
+  // Recipients reload the conversation and pick up the new text.
+  void notifyMessageSent(conversationId, updated.id);
 }
 
 function showImagePreview(url, name) {
@@ -2010,10 +3137,22 @@ function syncUnreadIndicators() {
   state.unreadCount = unreadCount;
   notifyNewMessages();
 
+  const othersUnread = state.conversations.filter(isOthersConversation).reduce((total, conversation) => {
+    const count = Number(conversation.unread_count);
+    return total + (Number.isSafeInteger(count) && count > 0 ? count : 0);
+  }, 0);
+  const chatsUnread = unreadCount - othersUnread;
   const unreadLabel = document.querySelector('#unread-message-count');
   if (unreadLabel) {
-    unreadLabel.textContent = `${unreadCount} unread`;
-    unreadLabel.hidden = unreadCount === 0;
+    unreadLabel.textContent = String(chatsUnread);
+    unreadLabel.title = `${chatsUnread} unread`;
+    unreadLabel.hidden = chatsUnread === 0;
+  }
+  const othersLabel = document.querySelector('#others-unread-count');
+  if (othersLabel) {
+    othersLabel.textContent = String(othersUnread);
+    othersLabel.title = `${othersUnread} unread from people who are not your friends`;
+    othersLabel.hidden = othersUnread === 0;
   }
   document.title = unreadCount ? `(${unreadCount}) PITBConnect — Messages` : 'PITBConnect — Messages';
   window.desktopApp?.setUnreadCount(unreadCount, shouldNotify);
@@ -2063,18 +3202,34 @@ async function loadMessages({ markRead = true, cacheImages = true } = {}) {
     state.messages = [];
     return;
   }
-  const payload = await api(`/conversations/${encodeURIComponent(conversation.id)}/messages`);
-  state.messages = Array.isArray(payload.data) ? payload.data : [];
-  if (markRead && document.hasFocus() && state.messages.some((message) =>
-    String(message.sender?.id) !== String(state.user.id) && !message.read_at)) {
+  const newestPagePath = `/conversations/${encodeURIComponent(conversation.id)}/messages?limit=${MESSAGE_PAGE_SIZE}`;
+  const applyPage = async (payload) => {
+    const newest = await decryptMessagesForDisplay(conversation.id, Array.isArray(payload.data) ? payload.data : []);
+    // Keep older pages the user already scrolled back to; a refresh only
+    // reloads the newest page.
+    const oldestNewId = newest.length ? Math.min(...newest.map((message) => Number(message.id))) : Infinity;
+    const olderLoaded = state.messages.filter((message) => !message.pending &&
+      String(message.conversation_id) === String(conversation.id) &&
+      Number(message.id) < oldestNewId);
+    state.messages = withOutgoing(conversation.id, [...newest, ...olderLoaded]);
+    if (!olderLoaded.length) state.hasOlderMessages = Boolean(payload.has_more);
+    state.readCursors = Array.isArray(payload.read_cursors) ? payload.read_cursors : [];
+    state.pinnedMessages = await decryptMessagesForDisplay(
+      conversation.id, Array.isArray(payload.pinned) ? payload.pinned : [],
+    );
+    state.pinIndex = Math.min(state.pinIndex, Math.max(0, state.pinnedMessages.length - 1));
+  };
+  await applyPage(await api(newestPagePath));
+  if (markRead && document.hasFocus() && hasUnreadFromOthers()) {
     await api(`/conversations/${encodeURIComponent(conversation.id)}/read`, { method: 'POST' });
-    state.messages = await api(`/conversations/${encodeURIComponent(conversation.id)}/messages`)
-      .then((result) => Array.isArray(result.data) ? result.data : []);
+    void announceRead(conversation.id);
+    await applyPage(await api(newestPagePath));
     conversation.unread_count = 0;
     renderSidebar();
     syncUnreadIndicators();
   }
-  if (cacheImages) await cacheMessageImages(conversation.id, state.messages);
+  // Images download in the background; each one appears as soon as it is ready.
+  if (cacheImages) void cacheMessageImages(conversation.id, state.messages);
 }
 
 async function notifyMessageSent(conversationId, messageId) {
@@ -2101,18 +3256,21 @@ async function refreshData() {
   state.refreshing = true;
   try {
     const membershipRevisionsAtStart = new Map(state.groupMembershipRevisions);
-    const [friends, requests, conversations, blockedUsers] = await Promise.all([
+    const [friends, requests, conversations, blockedUsers, conversationKeys] = await Promise.all([
       api('/friends'),
       api('/friends/requests?direction=incoming'),
       api('/conversations'),
       api('/blocks'),
+      // If this fails, keys are still fetched per conversation when needed.
+      api('/conversation-keys').catch(() => ({ data: [] })),
     ]);
+    await rememberConversationKeys(conversationKeys.data);
     state.friends = Array.isArray(friends.data) ? friends.data : [];
     state.requests = Array.isArray(requests.data) ? requests.data : [];
     state.blockedUsers = Array.isArray(blockedUsers.data) ? blockedUsers.data : [];
     const previousConversations = state.conversations;
     state.conversations = sortConversationsByLatest(
-      Array.isArray(conversations.data) ? conversations.data : [],
+      await decryptConversationPreviews(Array.isArray(conversations.data) ? conversations.data : []),
     ).map((conversation) => {
       if (conversation.type !== 'group') return conversation;
       const key = String(conversation.id);
@@ -2141,6 +3299,8 @@ async function refreshData() {
       renderThread();
     }
     renderSidebar();
+    renderChatBanner();
+    updateCallButtons();
 
     if (state.selectedConversationId) {
       await loadMessages();
@@ -2167,8 +3327,8 @@ function presenceText(userId) {
         String(participant.id) === String(state.typingUserId));
       if (typingUser) return `${typingUser.name} is typing…`;
     }
-    const memberNames = participantNames(conversation);
-    return `${conversation.participants?.length || 0} members${memberNames ? ` • ${memberNames}` : ''}`;
+    // The member count is shown next to the group name; this line lists who is in it.
+    return participantNames(conversation) || 'Group';
   }
   if (!state.socketConnected) return 'Presence unavailable';
   if (String(state.typingUserId) === String(userId)) return 'Typing…';
@@ -2265,7 +3425,7 @@ async function loadCallHistory({ append = false } = {}) {
   renderSidebar();
 
   try {
-    const result = await api(`/call-history?page=${page}`);
+    const result = await api(`/call-history?page=${page}${state.callHistoryFilter === 'missed' ? '&filter=missed' : ''}`);
     if (!Array.isArray(result.data)) throw new Error('The server returned an invalid call history response.');
     state.callHistory = append ? [...state.callHistory, ...result.data] : result.data;
     state.callHistoryPage = Number(result.current_page) || page;
@@ -2510,11 +3670,26 @@ async function startGroupCall(conversation, mediaType) {
   }
   state.localStream = stream;
   renderCallOverlay();
-  await sendCallEvent('group-call:start', {
+  const sent = await sendCallEvent('group-call:start', {
     call_id: call.id,
     conversation_id: call.conversationId,
     media_type: mediaType,
   });
+  if (sent !== false) expectGroupCallJoin(call.conversationId);
+}
+
+// The server answers group-call:start/join with "joined" or an error. A server
+// that predates group calls ignores them, so give up instead of hanging.
+const GROUP_CALL_JOIN_TIMEOUT_MS = 12000;
+
+function expectGroupCallJoin(conversationId) {
+  setTimeout(() => {
+    const call = state.call;
+    if (call?.kind === 'group' && call.phase === 'joining' && String(call.conversationId) === String(conversationId)) {
+      void sendCallEvent('group-call:leave', { call_id: call.id });
+      stopCall('The call server did not respond to the group call. It may be running an older version without group calls; ask your administrator to update the socket server.');
+    }
+  }, GROUP_CALL_JOIN_TIMEOUT_MS);
 }
 
 async function answerGroupCall() {
@@ -2537,7 +3712,8 @@ async function answerGroupCall() {
   }
   state.localStream = stream;
   renderCallOverlay();
-  await sendCallEvent('group-call:join', { call_id: call.id });
+  const sent = await sendCallEvent('group-call:join', { call_id: call.id });
+  if (sent !== false) expectGroupCallJoin(call.conversationId);
 }
 
 function sendGroupSignal(callId, userId, signal) {
@@ -2832,6 +4008,7 @@ async function handleCallSocketEvent(event, payload) {
 function handleSocketEvent(event, payload) {
   if (event === 'connect') {
     state.socketConnected = true;
+    if (state.pollTimer) startPolling();
     void sendCallEvent('call:ready', {
       enabled: Boolean(navigator.mediaDevices?.getUserMedia && typeof RTCPeerConnection !== 'undefined'),
       group_calls: true,
@@ -2874,6 +4051,20 @@ function handleSocketEvent(event, payload) {
     } else if (payload?.conversation_id) {
       window.chatSocket?.leaveConversation(payload.conversation_id);
     }
+  } else if (event === 'message.created' || event === 'message.updated') {
+    void handleMessagePush(event, payload).catch(() => refreshData());
+  } else if (event === 'conversation.read') {
+    handleReadPush(payload);
+  } else if (event === 'conversation.pins') {
+    if (String(payload?.conversation_id) === String(state.selectedConversationId)) {
+      void loadMessages({ markRead: false, cacheImages: false }).then(renderMessages).catch(() => {});
+    }
+  } else if (event === 'conversation.changed' || event === 'friends.changed') {
+    void refreshData();
+  } else if (event === 'conversation:message' &&
+    String(payload?.conversation_id) === String(state.selectedConversationId) &&
+    state.messages.some((message) => String(message.id) === String(payload?.message_id))) {
+    // Already shown by the API's push.
   } else if (event === 'conversation:message' &&
     Number.isSafeInteger(Number(payload?.conversation_id)) &&
     Number.isSafeInteger(Number(payload?.message_id))) {
@@ -2884,9 +4075,9 @@ function handleSocketEvent(event, payload) {
         renderMessages();
         renderSidebar();
         void cacheMessageImages(conversationId, state.messages);
-        if (document.hasFocus() && state.messages.some((message) =>
-          String(message.sender?.id) !== String(state.user.id) && !message.read_at)) {
+        if (document.hasFocus() && hasUnreadFromOthers()) {
           void api(`/conversations/${encodeURIComponent(conversationId)}/read`, { method: 'POST' })
+            .then(() => announceRead(conversationId))
             .then(() => loadMessages({ markRead: false, cacheImages: false }))
             .then(() => {
               if (String(state.selectedConversationId) === conversationId) {
@@ -2895,11 +4086,22 @@ function handleSocketEvent(event, payload) {
               }
             })
             .catch((error) => showNotice(`Message received, but read status could not be updated: ${error.message}`));
+        } else if (!document.hasFocus()) {
+          // The app is in the background: refresh unread counts, which shows the
+          // desktop notification for this chat too.
+          void refreshData();
         }
       }).catch((error) => showNotice(`A new message arrived, but could not be loaded: ${error.message}`));
     } else {
       void refreshData();
     }
+  } else if (event === 'conversation:read' &&
+    String(payload?.conversation_id) === String(state.selectedConversationId) &&
+    String(payload?.user_id) !== String(state.user?.id)) {
+    const conversationId = String(state.selectedConversationId);
+    void loadMessages({ markRead: false, cacheImages: false }).then(() => {
+      if (String(state.selectedConversationId) === conversationId) renderMessages();
+    }).catch(() => {});
   } else if (event === 'conversation:typing' && selectedConversation() &&
     String(payload?.conversation_id) === String(state.selectedConversationId) &&
     (selectedConversation().type === 'group'
@@ -2943,6 +4145,7 @@ function connectSocket() {
 
 function joinSelectedConversation() {
   if (!state.socketConnected || !state.selectedConversationId) return;
+  if (isReadOnly(selectedConversation())) return;
   if (state.activeRoomId && String(state.activeRoomId) !== String(state.selectedConversationId)) {
     window.chatSocket.leaveConversation(state.activeRoomId);
   }
@@ -2981,7 +4184,10 @@ function handleMessageTyping() {
 
 function startPolling() {
   stopPolling();
-  state.pollTimer = setInterval(() => refreshData(), REFRESH_INTERVAL);
+  state.pollTimer = setInterval(
+    () => refreshData(),
+    state.socketConnected ? CONNECTED_REFRESH_INTERVAL : REFRESH_INTERVAL,
+  );
 }
 
 function stopPolling() {
@@ -3008,14 +4214,21 @@ async function openFriend(friendId) {
   clearTypingIndicator();
   if (String(state.selectedConversationId) !== String(conversation.id)) cancelVoiceRecording();
   state.sidebarTool = null;
+  state.chatListTab = isOthersConversation(conversation) ? 'others' : 'chats';
   state.selectedConversationId = conversation.id;
   state.messages = [];
   state.replyTarget = null;
   state.selectedAttachment = null;
   clearAttachmentPreview();
+  state.hasOlderMessages = false;
+  state.messagesLoading = true;
   render();
   joinSelectedConversation();
-  await loadMessages();
+  try {
+    await loadMessages();
+  } finally {
+    state.messagesLoading = false;
+  }
   renderMessages();
 }
 
@@ -3032,14 +4245,21 @@ async function openGroupConversation(conversationId) {
   clearTypingIndicator();
   if (String(state.selectedConversationId) !== String(conversation.id)) cancelVoiceRecording();
   state.sidebarTool = null;
+  state.chatListTab = isOthersConversation(conversation) ? 'others' : 'chats';
   state.selectedConversationId = conversation.id;
   state.messages = [];
   state.replyTarget = null;
   state.selectedAttachment = null;
   clearAttachmentPreview();
+  state.hasOlderMessages = false;
+  state.messagesLoading = true;
   render();
   joinSelectedConversation();
-  await loadMessages();
+  try {
+    await loadMessages();
+  } finally {
+    state.messagesLoading = false;
+  }
   renderMessages();
 }
 
@@ -3134,27 +4354,25 @@ async function handleUnfriend(friendId) {
 async function handleBlockUser(userId) {
   const friend = state.friends.find((person) => String(person.id) === String(userId));
   const userName = friend?.name || 'this user';
-  if (!window.confirm(`Block ${userName}? They will no longer be able to contact you directly.`)) return;
+  if (!window.confirm(`Block ${userName}? Neither of you will be able to send messages. Your old messages stay readable.`)) return;
 
   await api(`/users/${encodeURIComponent(userId)}/block`, { method: 'POST' });
-  if (String(selectedConversation()?.friend?.id) === String(userId)) {
-    if (state.activeRoomId) window.chatSocket?.leaveConversation(state.activeRoomId);
-    state.selectedConversationId = null;
-    state.messages = [];
+  if (String(selectedConversation()?.friend?.id) === String(userId) && state.activeRoomId) {
+    window.chatSocket?.leaveConversation(state.activeRoomId);
     state.activeRoomId = null;
     state.joinedRoomId = null;
     stopLocalTyping();
     clearTypingIndicator();
-    render();
   }
   await refreshData();
-  showNotice(`${userName} blocked. You can unblock them from Blocked users.`, 'success');
+  showNotice(`${userName} blocked. You can unblock them here or from Blocked users.`, 'success');
 }
 
 async function handleUnblockUser(userId) {
   const blockedUser = state.blockedUsers.find((person) => String(person.id) === String(userId));
   await api(`/users/${encodeURIComponent(userId)}/block`, { method: 'DELETE' });
   await refreshData();
+  joinSelectedConversation();
   showNotice(`${blockedUser?.name || 'User'} unblocked.`, 'success');
 }
 
@@ -3190,6 +4408,35 @@ async function handleRemoveGroupMember(conversationId, userId, button) {
   showNotice(`${member.name} was removed from the group.`, 'success');
 }
 
+function setGroupIcon(conversationId, iconUrl) {
+  const key = String(conversationId);
+  state.conversations = state.conversations.map((conversation) =>
+    String(conversation.id) === key ? { ...conversation, icon_url: iconUrl } : conversation);
+  renderFriendList();
+  if (String(state.selectedConversationId) === key) renderThread();
+  const updated = state.conversations.find((conversation) => String(conversation.id) === key);
+  if (updated && document.querySelector('#group-modal-title')) renderGroupMembersModal(updated);
+}
+
+async function updateGroupIcon(conversationId, file) {
+  const allowedTypes = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+  if (!allowedTypes.has(file.type) || file.size > 5 * 1024 * 1024) {
+    throw new Error('Choose a JPEG, PNG, GIF, or WEBP image under 5 MB.');
+  }
+  const formData = new FormData();
+  formData.append('icon', file);
+  const payload = await api(`/groups/${encodeURIComponent(conversationId)}/icon`, { method: 'POST', body: formData });
+  setGroupIcon(conversationId, payload?.icon_url || null);
+  showNotice('Group icon updated.', 'success');
+}
+
+async function removeGroupIcon(conversationId) {
+  if (!window.confirm('Remove the group icon?')) return;
+  await api(`/groups/${encodeURIComponent(conversationId)}/icon`, { method: 'DELETE' });
+  setGroupIcon(conversationId, null);
+  showNotice('Group icon removed.', 'success');
+}
+
 async function handleAddGroupMember(form) {
   const conversationId = form.dataset.conversationId;
   const userId = new FormData(form).get('user_id')?.toString();
@@ -3217,6 +4464,13 @@ async function handleAddGroupMember(form) {
 
 async function handleSendMessage(form) {
   const field = form.elements.body;
+  if (state.editTarget) {
+    if (String(state.editTarget.conversation_id) === String(state.selectedConversationId)) {
+      await saveEditedMessage(state.editTarget, field);
+      return;
+    }
+    state.editTarget = null;
+  }
   const body = field.value.trim();
   const conversation = selectedConversation();
   const file = state.selectedAttachment;
@@ -3229,23 +4483,35 @@ async function handleSendMessage(form) {
     throw new Error('Attachments must be 5 MiB or smaller.');
   }
   stopLocalTyping();
+  if (!file) {
+    await sendTextMessage(conversation, body, replyTarget);
+    return;
+  }
+
   const submitButton = form.querySelector('button[type="submit"]');
   submitButton.disabled = true;
   try {
-    const payload = file ? new FormData() : { body };
-    if (file) {
-      if (body) payload.append('body', body);
-      payload.append('attachment', file);
-    }
-    if (replyTarget) {
-      if (payload instanceof FormData) payload.append('reply_to_message_id', replyTarget.id);
-      else payload.reply_to_message_id = replyTarget.id;
-    }
-    const sentMessage = await api(`/conversations/${encodeURIComponent(conversation.id)}/messages`, {
-      method: 'POST',
-      body: payload,
-    });
-    await notifyMessageSent(conversation.id, sentMessage.id);
+    const encryptedFile = await encryptFileBytes(new Uint8Array(await file.arrayBuffer()));
+    const fileDetails = {
+      name: file.name,
+      mime: file.type || 'application/octet-stream',
+      size: file.size,
+      key: encryptedFile.key,
+      iv: encryptedFile.iv,
+    };
+    const sentMessage = await decryptForDisplay(conversation.id, await sendEncrypted(
+      conversation.id,
+      { text: body || null, file: fileDetails },
+      (encrypted) => {
+        const payload = new FormData();
+        payload.append('body', encrypted.body);
+        payload.append('encrypted', '1');
+        payload.append('key_version', String(encrypted.key_version));
+        payload.append('attachment', new Blob([encryptedFile.data], { type: 'application/octet-stream' }), 'encrypted.bin');
+        if (replyTarget) payload.append('reply_to_message_id', replyTarget.id);
+        return api(`/conversations/${encodeURIComponent(conversation.id)}/messages`, { method: 'POST', body: payload });
+      },
+    ));
     field.value = '';
     state.replyTarget = null;
     updateReplyPreview();
@@ -3253,7 +4519,7 @@ async function handleSendMessage(form) {
     const attachmentInput = form.querySelector('#attachment-input');
     if (attachmentInput) attachmentInput.value = '';
     clearAttachmentPreview();
-    if (file && CACHED_IMAGE_TYPES.has(sentMessage.attachment?.mime)) {
+    if (CACHED_IMAGE_TYPES.has(sentMessage.attachment?.mime)) {
       try {
         const key = attachmentCacheKey(conversation.id, sentMessage.id);
         const dataUrl = await window.localAttachments.saveImage({
@@ -3268,15 +4534,160 @@ async function handleSendMessage(form) {
         showNotice(`The image was sent, but could not be saved to this device: ${error.message}`);
       }
     }
-    await refreshData();
-    const messageList = document.querySelector('#message-list');
-    if (messageList && String(state.selectedConversationId) === String(conversation.id)) {
-      messageList.scrollTop = messageList.scrollHeight;
-    }
+    applySentMessage(conversation.id, sentMessage);
+    void notifyMessageSent(conversation.id, sentMessage.id);
   } finally {
     submitButton.disabled = false;
     field.focus();
   }
+}
+
+// Text messages appear immediately with a "sending" clock and are confirmed in
+// place when the server responds. Sends are queued so they arrive in order.
+async function sendTextMessage(conversation, body, replyTarget) {
+  const tempId = `pending-${crypto.randomUUID()}`;
+  const pendingMessage = {
+    id: tempId,
+    pending: true,
+    conversation_id: conversation.id,
+    sender: { id: state.user.id, name: state.user.name, avatar_url: state.user.avatar_url },
+    body,
+    type: 'text',
+    reply_to: replyTarget ? {
+      id: replyTarget.id,
+      sender: { id: replyTarget.sender?.id, name: replyTarget.sender?.name },
+      body: replyTarget.body,
+      type: replyTarget.type,
+      attachment: replyTarget.attachment ? { name: replyTarget.attachment.name } : null,
+      deleted_for_everyone_at: replyTarget.deleted_for_everyone_at,
+      unavailable: false,
+    } : null,
+    attachment: null,
+    is_forwarded: false,
+    created_at: new Date().toISOString(),
+    delivered_at: null,
+    read_at: null,
+  };
+  const entry = { conversationId: conversation.id, message: pendingMessage, confirmed: false };
+  state.outgoing.set(tempId, entry);
+
+  const field = document.querySelector('#message-form textarea');
+  if (field) field.value = '';
+  state.replyTarget = null;
+  updateReplyPreview();
+  showOutgoingChanges(conversation.id, true);
+
+  const request = state.sendQueue.then(() =>
+    sendEncrypted(conversation.id, { text: body }, (encrypted) =>
+      api(`/conversations/${encodeURIComponent(conversation.id)}/messages`, {
+        method: 'POST',
+        body: replyTarget ? { ...encrypted, reply_to_message_id: replyTarget.id } : encrypted,
+      })));
+  state.sendQueue = request.catch(() => {});
+
+  let sentMessage;
+  try {
+    sentMessage = await decryptForDisplay(conversation.id, await request);
+  } catch (error) {
+    state.outgoing.delete(tempId);
+    showOutgoingChanges(conversation.id);
+    if (String(state.selectedConversationId) === String(conversation.id)) {
+      const currentField = document.querySelector('#message-form textarea');
+      if (currentField && !currentField.value.trim()) currentField.value = body;
+      if (replyTarget && !state.replyTarget) {
+        state.replyTarget = replyTarget;
+        updateReplyPreview();
+      }
+    }
+    throw new Error(`Message not sent: ${error.message}`);
+  }
+
+  entry.message = sentMessage;
+  entry.confirmed = true;
+  applySentMessage(conversation.id, sentMessage);
+  void notifyMessageSent(conversation.id, sentMessage.id);
+}
+
+// Merges this device's outgoing messages into a list loaded from the server
+// (newest first). A sent message is dropped from the outgoing list once the
+// server's list includes it.
+function withOutgoing(conversationId, messages) {
+  const base = messages.filter((message) => !message.pending);
+  const ids = new Set(base.map((message) => String(message.id)));
+  const extra = [];
+  for (const [key, entry] of state.outgoing) {
+    if (String(entry.conversationId) !== String(conversationId)) continue;
+    if (entry.confirmed && ids.has(String(entry.message.id))) {
+      state.outgoing.delete(key);
+      continue;
+    }
+    extra.push(entry.message);
+  }
+  return [...extra.reverse(), ...base];
+}
+
+function showOutgoingChanges(conversationId, scrollToBottom = false) {
+  if (String(state.selectedConversationId) !== String(conversationId)) return;
+  const outgoingIds = new Set([...state.outgoing.values()].map((entry) => String(entry.message.id)));
+  state.messages = withOutgoing(
+    conversationId,
+    state.messages.filter((message) => !message.pending && !outgoingIds.has(String(message.id))),
+  );
+  renderMessages();
+  if (scrollToBottom) {
+    const list = document.querySelector('#message-list');
+    if (list) list.scrollTop = list.scrollHeight;
+  }
+}
+
+// Shows a message the server has accepted without reloading everything.
+function applySentMessage(conversationId, message) {
+  const key = String(conversationId);
+  if (String(state.selectedConversationId) === key &&
+    !state.messages.some((item) => String(item.id) === String(message.id))) {
+    const confirmedOutgoing = [...state.outgoing.values()].some((entry) =>
+      String(entry.message.id) === String(message.id));
+    if (!confirmedOutgoing) state.messages = [message, ...state.messages];
+  }
+  showOutgoingChanges(conversationId, true);
+  state.conversations = sortConversationsByLatest(state.conversations.map((conversation) =>
+    String(conversation.id) === key
+      ? { ...conversation, last_message: message, updated_at: message.created_at }
+      : conversation));
+  renderFriendList();
+}
+
+// Removes every message in this chat from my view only; the other people in the
+// chat still see them unless they clear it too.
+async function handleClearChat() {
+  const conversation = selectedConversation();
+  if (!conversation) return;
+  const others = conversation.type === 'group'
+    ? 'Other members'
+    : conversation.friend?.name || 'The other person';
+  if (!window.confirm(`Clear this chat? All messages will be removed from your view only. ${others} will still see them.`)) return;
+
+  await api(`/conversations/${encodeURIComponent(conversation.id)}/clear`, { method: 'POST' });
+  const conversationId = String(conversation.id);
+  for (const [key, entry] of state.outgoing) {
+    if (String(entry.conversationId) === conversationId) state.outgoing.delete(key);
+  }
+  if (String(state.selectedConversationId) === conversationId) {
+    state.messages = [];
+    state.pinnedMessages = [];
+    state.readCursors = [];
+    state.hasOlderMessages = false;
+    state.replyTarget = null;
+    state.editTarget = null;
+    updateReplyPreview();
+    renderMessages();
+  }
+  state.conversations = state.conversations.map((item) => String(item.id) === conversationId
+    ? { ...item, last_message: null, unread_count: 0 }
+    : item);
+  renderFriendList();
+  syncUnreadIndicators();
+  showNotice(`Chat cleared for you. ${others} can still see the messages.`, 'success');
 }
 
 async function handleDeleteMessage(messageId, scope) {
@@ -3308,6 +4719,11 @@ async function handleDeleteMessage(messageId, scope) {
       cleanupWarning = ` The local image copy could not be removed: ${error.message}`;
     }
   }
+  state.messages = forEveryone
+    ? state.messages.map((item) => String(item.id) === String(message.id)
+      ? { ...item, body: null, attachment: null, deleted_for_everyone_at: new Date().toISOString() }
+      : item)
+    : state.messages.filter((item) => String(item.id) !== String(message.id));
   await loadMessages();
   renderMessages();
   await refreshData();
@@ -3430,11 +4846,26 @@ async function updateProfilePicture(file) {
     throw new Error('The avatar upload was accepted but the server did not return the updated profile.');
   }
 
-  state.user = payload.user;
-  localStorage.setItem(USER_KEY, JSON.stringify(payload.user));
-  render();
-  renderProfileModal();
+  applyUpdatedProfile(payload.user);
   showNotice('Profile picture updated.', 'success');
+}
+
+// Re-renders everything showing your picture, keeping whichever panel or
+// dialog you changed it from open.
+function applyUpdatedProfile(user) {
+  const profileModalOpen = Boolean(document.querySelector('#profile-modal-title'));
+  state.user = user;
+  localStorage.setItem(USER_KEY, JSON.stringify(user));
+  render();
+  if (profileModalOpen) renderProfileModal();
+}
+
+async function removeProfilePicture() {
+  if (!window.confirm('Remove your profile picture?')) return;
+  const payload = await api('/user/profile-picture', { method: 'DELETE' });
+  if (!payload?.user) throw new Error('The server did not return the updated profile.');
+  applyUpdatedProfile(payload.user);
+  showNotice('Profile picture removed.', 'success');
 }
 
 function toggleEmojiPicker() {
@@ -3597,7 +5028,10 @@ app.addEventListener('click', async (event) => {
     } else if (action === 'toggle-sidebar-tool') {
       state.sidebarTool = state.sidebarTool === button.dataset.tool ? null : button.dataset.tool;
       renderSidebar();
-      if (state.sidebarTool === 'calls') void loadCallHistory();
+      if (state.sidebarTool === 'calls') {
+        void loadCallHistory();
+        markMissedCallsSeen();
+      }
       if (state.sidebarTool === 'search') {
         document.querySelector('#friend-search')?.focus();
       }
@@ -3618,6 +5052,18 @@ app.addEventListener('click', async (event) => {
       renderGroupMembersModal(conversation);
     } else if (action === 'close-modal') {
       closeModal();
+    } else if (action === 'open-chat-search') {
+      openChatSearch();
+    } else if (action === 'close-chat-search') {
+      closeChatSearch();
+    } else if (action === 'open-search-result') {
+      await openSearchResult(button.dataset.conversationId, button.dataset.messageId);
+    } else if (action === 'remove-profile-picture') {
+      await removeProfilePicture();
+    } else if (action === 'choose-group-icon') {
+      document.querySelector('#group-icon-input')?.click();
+    } else if (action === 'remove-group-icon') {
+      await removeGroupIcon(id);
     } else if (action === 'choose-profile-picture') {
       document.querySelector('#profile-picture-input')?.click();
     } else if (action === 'check-updates') {
@@ -3639,6 +5085,62 @@ app.addEventListener('click', async (event) => {
       await loadCallHistory({ append: true });
     } else if (action === 'call-audio' || action === 'call-video') {
       await startCall(action === 'call-video' ? 'video' : 'audio');
+    } else if (action === 'chat-list-tab') {
+      state.chatListTab = button.dataset.tab === 'others' ? 'others' : 'chats';
+      renderFriendList();
+    } else if (action === 'add-friend-from-chat') {
+      button.disabled = true;
+      await api('/friends/requests', { method: 'POST', body: { phone: button.dataset.phone } });
+      showNotice('Friend request sent. The chat moves to Chats once they accept.', 'success');
+      await refreshData();
+    } else if (action === 'clear-chat') {
+      await handleClearChat();
+    } else if (action === 'message-by-phone') {
+      const input = document.querySelector('#friend-phone');
+      const phone = input?.value.trim();
+      if (!phone || !input.checkValidity()) throw new Error('Enter the phone number in international format, e.g. +923001234567.');
+      const conversation = await api('/conversations', { method: 'POST', body: { phone } });
+      state.conversations = sortConversationsByLatest([
+        conversation, ...state.conversations.filter((item) => String(item.id) !== String(conversation.id)),
+      ]);
+      state.addFriendPhone = '';
+      await openFriend(conversation.friend.id);
+    } else if (action === 'accept-request' || action === 'decline-request') {
+      const accept = action === 'accept-request';
+      await api(`/conversations/${encodeURIComponent(id)}/request/${accept ? 'accept' : 'decline'}`, { method: 'POST' });
+      if (!accept && String(state.selectedConversationId) === String(id)) {
+        document.querySelector('[data-action="show-friends"]')?.click();
+      }
+      await refreshData();
+      showNotice(accept ? 'Message request accepted.' : 'Message request declined.', 'success');
+    } else if (action === 'toggle-pin') {
+      button.closest('.message-menu')?.removeAttribute('open');
+      const conversation = selectedConversation();
+      const messageId = button.dataset.messageId;
+      const pinned = state.pinnedMessages.some((item) => String(item.id) === String(messageId));
+      await api(
+        `/conversations/${encodeURIComponent(conversation.id)}/messages/${encodeURIComponent(messageId)}/pin`,
+        { method: pinned ? 'DELETE' : 'POST' },
+      );
+      await loadMessages({ markRead: false, cacheImages: false });
+      renderMessages();
+      showNotice(pinned ? 'Message unpinned.' : 'Message pinned for everyone in this chat.', 'success');
+    } else if (action === 'jump-to-pin') {
+      const messageId = button.dataset.messageId;
+      // Each click moves on to the next pin, as in WhatsApp.
+      if (state.pinnedMessages.length > 1) state.pinIndex = (state.pinIndex + 1) % state.pinnedMessages.length;
+      await jumpToMessage(messageId);
+      renderPinnedBar();
+    } else if (action === 'call-filter') {
+      state.callHistoryFilter = button.dataset.filter === 'missed' ? 'missed' : 'all';
+      state.callHistory = [];
+      state.callHistoryPage = 0;
+      await loadCallHistory();
+    } else if (action === 'test-notification') {
+      const shown = await window.desktopApp?.testNotification?.();
+      showNotice(shown
+        ? 'Test notification sent. If it did not appear, open Windows Settings > System > Notifications, make sure PITBConnect is allowed, and turn off Do not disturb.'
+        : 'This computer does not support desktop notifications.', shown ? 'success' : 'error');
     } else if (action === 'open-create-group') {
       renderCreateGroupModal();
     } else if (action === 'remove-group-chip') {
@@ -3700,6 +5202,13 @@ app.addEventListener('click', async (event) => {
       toggleEmojiPicker();
     } else if (button.dataset.emoji) {
       insertEmoji(button.dataset.emoji);
+    } else if (action === 'edit-message') {
+      button.closest('.message-menu')?.removeAttribute('open');
+      const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
+      if (!message) throw new Error('This message is no longer available.');
+      beginEdit(message);
+    } else if (action === 'cancel-edit') {
+      cancelEdit();
     } else if (action === 'reply-message') {
       button.closest('.message-menu')?.removeAttribute('open');
       const message = state.messages.find((item) => String(item.id) === String(button.dataset.messageId));
@@ -3773,6 +5282,10 @@ app.addEventListener('input', (event) => {
     state.friendSearchQuery = event.target.value;
     renderFriendList();
   }
+  if (event.target.id === 'chat-search-input') {
+    state.chatSearch.query = event.target.value;
+    scheduleChatSearch();
+  }
   if (event.target.id === 'friend-phone') {
     state.addFriendPhone = event.target.value;
   }
@@ -3796,6 +5309,25 @@ app.addEventListener('change', (event) => {
     updateSettings({ blurMessages: event.target.checked });
     return;
   }
+  if (event.target.id === 'setting-edit-minutes') {
+    const select = event.target;
+    const previous = messageEditMinutes();
+    select.disabled = true;
+    void api('/user/settings', {
+      method: 'PATCH',
+      body: { message_edit_minutes: Number(select.value) },
+    }).then((result) => {
+      storeUser({ ...state.user, ...result.user });
+      renderMessages();
+      showNotice('Edit time saved.', 'success');
+    }).catch((error) => {
+      select.value = String(previous);
+      showNotice(`The edit time could not be saved: ${error.message}`);
+    }).finally(() => {
+      select.disabled = false;
+    });
+    return;
+  }
   if (event.target.matches('#forward-message-form input[name="target_conversation_ids"]')) {
     const count = document.querySelector('#forward-selection-count');
     if (count) {
@@ -3809,6 +5341,16 @@ app.addEventListener('change', (event) => {
     if (event.target.checked) state.selectedGroupFriendIds.add(friendId);
     else state.selectedGroupFriendIds.delete(friendId);
     updateCreateGroupView();
+    return;
+  }
+  if (event.target.id === 'group-icon-input') {
+    const file = event.target.files?.[0] || null;
+    const conversationId = event.target.dataset.conversationId;
+    event.target.value = '';
+    if (!file || !conversationId) return;
+    void updateGroupIcon(conversationId, file).catch((error) => {
+      showNotice(error.message || 'The group icon could not be updated.');
+    });
     return;
   }
   if (event.target.id === 'profile-picture-input') {
@@ -3851,6 +5393,10 @@ app.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !document.querySelector('#emoji-picker')?.hidden) {
     closeEmojiPicker();
   }
+  if (event.target.matches('#message-form textarea') && event.key === 'Escape' && state.editTarget) {
+    cancelEdit();
+    return;
+  }
   if (event.target.matches('#message-form textarea') && event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
     event.target.form.requestSubmit();
@@ -3859,6 +5405,25 @@ app.addEventListener('keydown', (event) => {
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && state.voiceRecording) cancelVoiceRecording();
+  if (event.key === 'Escape' && state.chatSearch.open && document.activeElement?.id === 'chat-search-input') {
+    closeChatSearch();
+  }
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'f' && selectedConversation() && state.token) {
+    event.preventDefault();
+    openChatSearch();
+  }
+});
+
+app.addEventListener('scroll', (event) => {
+  if (event.target.id === 'message-list' && event.target.scrollTop < 150) void loadOlderMessages();
+}, true);
+
+window.addEventListener('focus', () => {
+  const conversationId = String(state.selectedConversationId || '');
+  if (!state.token || !conversationId || !hasUnreadFromOthers()) return;
+  void loadMessages({ cacheImages: false }).then(() => {
+    if (String(state.selectedConversationId) === conversationId) renderMessages();
+  }).catch(() => {});
 });
 
 applySettings();
@@ -3870,8 +5435,13 @@ window.chatSocket?.onEvent(handleSocketEvent);
 checkForUpdates(false);
 
 if (state.token && state.user) {
+  void api('/user').then((user) => {
+    if (user?.id && String(user.id) === String(state.user?.id)) {
+      storeUser({ ...state.user, message_edit_minutes: user.message_edit_minutes ?? DEFAULT_MESSAGE_EDIT_MINUTES });
+    }
+  }).catch(() => {});
   render();
-  refreshData().then(startPolling);
+  refreshData().then(startPolling).then(loadMissedCallBadge);
   connectSocket();
 } else {
   render();
