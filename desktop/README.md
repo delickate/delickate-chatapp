@@ -1,4 +1,4 @@
-# PITBConnect Desktop
+# DailyConnect Desktop
 
 Electron desktop client for the Laravel chat API.
 

@@ -65,12 +65,12 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   width: 42px;
   height: 42px;
   border-radius: 15px;
-  background: var(--green);
-  color: #fff;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  font-size: 24px;
-  font-weight: 800;
+  overflow: hidden;
+  background: transparent;
+  font-size: 0;
 }
+.brand-mark svg,
+.brand-mark img { width: 100%; height: 100%; display: block; }
 .auth-screen {
   overflow-y: auto;
   padding: 24px;
@@ -144,6 +144,9 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 }
 .primary-button:hover { background: var(--green-dark); transform: translateY(-1px); }
 .auth-submit { margin-top: 5px; }
+.auth-hint { margin: 0 0 4px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.auth-forgot { margin: -6px 0 0; text-align: right; font-size: 13px; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 6px; }
 .switch-auth { margin: 18px 0 0; color: #78847f; text-align: center; font-size: 13px; }
 .text-button { padding: 0; border: 0; color: var(--green); background: none; font-weight: 700; }
 .small-button { padding: 8px 10px; border: 0; border-radius: 8px; color: var(--green); background: var(--green-soft); font-size: 12px; font-weight: 700; }

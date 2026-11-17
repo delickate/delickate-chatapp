@@ -1,11 +1,42 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification, session, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, session, shell } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { io } = require('socket.io-client');
 const { version: APP_VERSION } = require('../package.json');
 
+// Our API/socket servers are dual-stack behind Cloudflare. On networks with
+// broken IPv6, Chromium's Happy Eyeballs sometimes connects over IPv6 and every
+// request in that session fails with ERR_CONNECTION_RESET ("Failed to fetch"),
+// while IPv4 works fine. We force IPv4:
+//   - Node (socket.io-client runs in this process) prefers IPv4 addresses.
+//   - Chromium (renderer fetch + net.fetch) has no "prefer IPv4" switch, so we
+//     resolve each host's IPv4 at startup and pin it via host-resolver-rules.
+// Also disable QUIC so connections use reliable TCP. Must run before app ready.
+require('node:dns').setDefaultResultOrder('ipv4first');
+app.commandLine.appendSwitch('disable-quic');
+
+// Resolve each host's IPv4 synchronously so host-resolver-rules is set BEFORE
+// Electron's network service starts. (An async resolve races app readiness and
+// often lands too late.) We run the bundled binary as Node to do the lookup.
+const REALTIME_HOSTS = ['api.sanjakarobar.com', 'socket.sanjakarobar.com'];
+function resolveIpv4Sync(host) {
+  try {
+    const script = `require('dns').resolve4(${JSON.stringify(host)},(e,a)=>{if(e||!a||!a[0])process.exit(1);process.stdout.write(a[0]);});`;
+    const out = require('node:child_process').execFileSync(process.execPath, ['-e', script], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, timeout: 4000, encoding: 'utf8',
+    });
+    return /^\d+\.\d+\.\d+\.\d+$/.test(out.trim()) ? out.trim() : null;
+  } catch {
+    return null; // Fall back to Chromium's default resolution for this host.
+  }
+}
+const hostRules = REALTIME_HOSTS
+  .map((host) => { const ip = resolveIpv4Sync(host); return ip ? `MAP ${host} ${ip}` : null; })
+  .filter(Boolean);
+if (hostRules.length) app.commandLine.appendSwitch('host-resolver-rules', hostRules.join(', '));
+
 const MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024;
-const WINDOW_TITLE = 'PITBConnect — Messages';
+const WINDOW_TITLE = 'DailyConnect — Messages';
 const RELEASES_API_URL = 'https://api.github.com/repos/delickate/delickate-chatapp/releases/latest';
 const RELEASES_DOWNLOAD_URL = 'https://github.com/delickate/delickate-chatapp/releases/download';
 const IMAGE_TYPES = {
@@ -116,7 +147,7 @@ function getReleaseDownloadUrl(release, version) {
   const assets = Array.isArray(release?.assets) ? release.assets : [];
   const installerAsset = assets.find((asset) => {
     const assetName = String(asset?.name || '').toLowerCase();
-    return assetName.includes('pitbconnect') && (assetName.endsWith('.exe') || assetName.includes('setup'));
+    return assetName.includes('dailyconnect') && (assetName.endsWith('.exe') || assetName.includes('setup'));
   });
 
   if (installerAsset?.browser_download_url) {
@@ -125,7 +156,7 @@ function getReleaseDownloadUrl(release, version) {
 
   if (exactVersion) {
     const [major, minor, patch] = parseVersion(exactVersion);
-    return `${RELEASES_DOWNLOAD_URL}/v${major}.${minor}.${patch}/PITBConnectSetup.exe`;
+    return `${RELEASES_DOWNLOAD_URL}/v${major}.${minor}.${patch}/DailyConnectSetup.exe`;
   }
 
   return release?.html_url || 'https://github.com/delickate/delickate-chatapp/releases';
@@ -155,14 +186,14 @@ ipcMain.handle('desktop:check-updates', async (event) => {
   const response = await fetch(RELEASES_API_URL, {
     headers: {
       Accept: 'application/vnd.github+json',
-      'User-Agent': 'PITBConnect-Desktop',
+      'User-Agent': 'DailyConnect-Desktop',
       'X-GitHub-Api-Version': '2022-11-28',
     },
     signal: AbortSignal.timeout(10000),
   });
   if (!response.ok) {
     throw new Error(response.status === 404
-      ? 'No PITBConnect release has been published yet.'
+      ? 'No DailyConnect release has been published yet.'
       : `GitHub update check failed (${response.status}).`);
   }
 
@@ -188,7 +219,7 @@ ipcMain.handle('desktop:download-update', async (event, version) => {
   const response = await fetch(RELEASES_API_URL, {
     headers: {
       Accept: 'application/vnd.github+json',
-      'User-Agent': 'PITBConnect-Desktop',
+      'User-Agent': 'DailyConnect-Desktop',
       'X-GitHub-Api-Version': '2022-11-28',
     },
     signal: AbortSignal.timeout(10000),
@@ -236,8 +267,31 @@ ipcMain.handle('desktop:copy-text', (event, value) => {
   return true;
 });
 
+// Incoming-call invites must surface the window even when the app is minimized
+// or in the background. Minimized windows have their renderer throttled, so the
+// call popup would otherwise only appear after the user opens the app by hand.
+const INCOMING_CALL_EVENTS = new Set(['call:invite', 'group-call:invite']);
+
+function bringWindowToFront() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  if (!mainWindow.isVisible()) mainWindow.show();
+  // Briefly force the window above others so the ringing UI is actually seen,
+  // then drop always-on-top so it behaves like a normal window afterwards.
+  mainWindow.setAlwaysOnTop(true);
+  mainWindow.show();
+  mainWindow.focus();
+  setTimeout(() => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setAlwaysOnTop(false);
+  }, 1500);
+  if (process.platform === 'win32' && !mainWindow.isFocused()) {
+    mainWindow.flashFrame(true);
+  }
+}
+
 function sendSocketEvent(event, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
+    if (INCOMING_CALL_EVENTS.has(event)) bringWindowToFront();
     mainWindow.webContents.send('chat:socket-event', { event, payload });
   }
 }
@@ -358,7 +412,7 @@ ipcMain.handle('chat:call-event', (_event, { event, payload } = {}) => {
 // Windows only shows toasts for an app whose ID matches its Start-menu
 // shortcut; Squirrel names it com.squirrel.<package name>.<executable name>.
 if (process.platform === 'win32') {
-  app.setAppUserModelId(app.isPackaged ? 'com.squirrel.desktop.PITBConnect' : process.execPath);
+  app.setAppUserModelId(app.isPackaged ? 'com.squirrel.desktop.DailyConnect' : process.execPath);
 }
 
 const activeNotifications = new Set();
@@ -399,18 +453,43 @@ ipcMain.on('desktop:notify', (event, { title, body, conversationId } = {}) => {
 });
 
 // Settings > "Send a test notification": shown even while the app is focused,
-// so people can check that Windows allows PITBConnect's notifications.
+// so people can check that Windows allows DailyConnect's notifications.
 ipcMain.handle('desktop:test-notification', (event) => {
   if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return false;
   if (!Notification.isSupported()) return false;
   showDesktopNotification({
-    title: 'PITBConnect',
+    title: 'DailyConnect',
     body: 'Notifications are working. New messages will appear like this when the app is in the background.',
   });
   return true;
 });
 
-ipcMain.on('chat:unread-count', (event, { count, notify } = {}) => {
+// Shows the unread count as a red badge on the app's taskbar / dock icon.
+// Windows has no numeric taskbar badge, so we overlay a small red counter
+// image (rendered by the renderer) on the bottom-right of the icon; macOS and
+// Linux (Unity) show a real numeric badge via setBadgeCount.
+function updateIconBadge(count, badge) {
+  if (process.platform !== 'win32') {
+    app.setBadgeCount(count);
+    return;
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  if (count < 1 || typeof badge !== 'string' ||
+    !badge.startsWith('data:image/png;base64,') || badge.length > 50000) {
+    mainWindow.setOverlayIcon(null, '');
+    return;
+  }
+
+  const overlay = nativeImage.createFromDataURL(badge);
+  if (overlay.isEmpty()) {
+    mainWindow.setOverlayIcon(null, '');
+    return;
+  }
+  mainWindow.setOverlayIcon(overlay, `${count} unread message${count === 1 ? '' : 's'}`);
+}
+
+ipcMain.on('chat:unread-count', (event, { count, notify, badge } = {}) => {
   if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
   if (!Number.isSafeInteger(count) || count < 0 || typeof notify !== 'boolean') {
     console.error('Ignoring invalid unread-message count from the renderer.');
@@ -423,6 +502,8 @@ ipcMain.on('chat:unread-count', (event, { count, notify } = {}) => {
   } else if (notify) {
     mainWindow.flashFrame(true);
   }
+
+  updateIconBadge(count, badge);
 });
 
 function attachmentCachePath(userId, conversationId, messageId, mime) {
@@ -507,6 +588,9 @@ const createWindow = () => {
     minHeight: 620,
     backgroundColor: '#f4f7f6',
     autoHideMenuBar: true,
+    // Window / taskbar icon while running unpackaged (npm run start). Packaged
+    // builds get their icon embedded in the .exe via packagerConfig.icon.
+    icon: path.join(__dirname, 'assets', 'icon.ico'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -541,7 +625,7 @@ app.whenReady().then(() => {
     dialog.showMessageBox(mainWindow, {
       type: 'question',
       title: 'Allow microphone and camera',
-      message: 'PITBConnect needs access to your microphone and camera for calls and voice messages.',
+      message: 'DailyConnect needs access to your microphone and camera for calls and voice messages.',
       buttons: ['Allow', 'Deny'],
       defaultId: 1,
       cancelId: 1,

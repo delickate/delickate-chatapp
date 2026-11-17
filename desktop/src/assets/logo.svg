@@ -1,0 +1,17 @@
+<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DailyConnect">
+  <defs>
+    <linearGradient id="dc-bg" x1="4" y1="2" x2="44" y2="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3b93e3"/>
+      <stop offset="1" stop-color="#1b5b9b"/>
+    </linearGradient>
+  </defs>
+  <rect width="48" height="48" rx="12" fill="url(#dc-bg)"/>
+  <!-- back bubble: the second person being connected -->
+  <path d="M28 9h7a5 5 0 0 1 5 5v5a5 5 0 0 1-5 5h-1.5l.5 4-4.8-4H29a5 5 0 0 1-5-5" fill="#ffffff" opacity=".42"/>
+  <!-- front bubble: the conversation, with a tail -->
+  <path d="M13 14h17a5 5 0 0 1 5 5v8a5 5 0 0 1-5 5H19l-6.2 4.6.6-4.6H13a5 5 0 0 1-5-5v-8a5 5 0 0 1 5-5z" fill="#ffffff"/>
+  <!-- three dots: a live chat -->
+  <circle cx="16.5" cy="23" r="2.1" fill="#2878c7"/>
+  <circle cx="23.5" cy="23" r="2.1" fill="#2878c7"/>
+  <circle cx="30.5" cy="23" r="2.1" fill="#2878c7"/>
+</svg>

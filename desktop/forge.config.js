@@ -17,7 +17,9 @@ const squirrelSigningConfig = windowsCertificatePath
 module.exports = {
   packagerConfig: {
     asar: true,
-    executableName: 'PITBConnect',
+    executableName: 'DailyConnect',
+    // Packager appends the platform extension (.ico on Windows, .icns on macOS).
+    icon: path.join(__dirname, 'src', 'assets', 'icon'),
     tmpdir: path.join(__dirname, 'out', '.packager-tmp', `build-${process.pid}`),
   },
   rebuildConfig: {},
@@ -26,8 +28,8 @@ module.exports = {
       name: '@electron-forge/maker-squirrel',
       config: {
         ...squirrelSigningConfig,
-        setupExe: 'PITBConnectSetup.exe',
-        setupIcon: undefined,
+        setupExe: 'DailyConnectSetup.exe',
+        setupIcon: path.join(__dirname, 'src', 'assets', 'icon.ico'),
       },
     },
     {

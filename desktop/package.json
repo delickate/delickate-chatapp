@@ -1,9 +1,9 @@
 {
   "name": "desktop",
-  "productName": "PITBConnect",
+  "productName": "DailyConnect",
   "version": "1.0.1",
   "private": true,
-  "description": "Desktop messaging client for PITBConnect",
+  "description": "Desktop messaging client for DailyConnect",
   "keywords": [],
   "license": "MIT",
   "author": {

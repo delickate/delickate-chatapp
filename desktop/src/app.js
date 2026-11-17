@@ -1,13 +1,23 @@
 'use strict';
 
-const API_URL_KEY = 'pitbconnect.apiUrl';
-const TOKEN_KEY = 'pitbconnect.authToken';
-const USER_KEY = 'pitbconnect.currentUser';
-const SOCKET_URL_KEY = 'pitbconnect.socketUrl';
-const SETTINGS_KEY = 'pitbconnect.settings';
+const API_URL_KEY = 'dailyconnect.apiUrl';
+const TOKEN_KEY = 'dailyconnect.authToken';
+const USER_KEY = 'dailyconnect.currentUser';
+const SOCKET_URL_KEY = 'dailyconnect.socketUrl';
+const SETTINGS_KEY = 'dailyconnect.settings';
 const DEFAULT_SETTINGS = { notifications: true, blurMessages: false };
 const DEFAULT_API_URL = 'https://api.sanjakarobar.com/api';
 const DEFAULT_SOCKET_URL = 'https://socket.sanjakarobar.com';
+// DailyConnect logo: a blue squircle with two overlapping chat bubbles.
+// Kept inline so it scales crisply and needs no asset load in the renderer.
+const BRAND_LOGO = `<svg class="brand-logo" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+  <defs><linearGradient id="dc-bg" x1="4" y1="2" x2="44" y2="46" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#3b93e3"/><stop offset="1" stop-color="#1b5b9b"/></linearGradient></defs>
+  <rect width="48" height="48" rx="12" fill="url(#dc-bg)"/>
+  <path d="M28 9h7a5 5 0 0 1 5 5v5a5 5 0 0 1-5 5h-1.5l.5 4-4.8-4H29a5 5 0 0 1-5-5" fill="#ffffff" opacity=".42"/>
+  <path d="M13 14h17a5 5 0 0 1 5 5v8a5 5 0 0 1-5 5H19l-6.2 4.6.6-4.6H13a5 5 0 0 1-5-5v-8a5 5 0 0 1 5-5z" fill="#ffffff"/>
+  <circle cx="16.5" cy="23" r="2.1" fill="#2878c7"/><circle cx="23.5" cy="23" r="2.1" fill="#2878c7"/><circle cx="30.5" cy="23" r="2.1" fill="#2878c7"/>
+</svg>`;
 // Background sync. With the realtime socket connected, messages arrive
 // instantly, so polling only catches up on friend requests and receipts.
 const REFRESH_INTERVAL = 5000;
@@ -56,6 +66,9 @@ const state = {
   token: readStoredValue(TOKEN_KEY, 'daylight.authToken'),
   user: readStoredUser(),
   authMode: 'login',
+  forgotStage: 'request',
+  forgotPhone: '',
+  forgotEmailHint: '',
   friends: [],
   blockedUsers: [],
   callHistory: [],
@@ -401,8 +414,11 @@ async function api(path, options = {}) {
       headers,
       body: options.body === undefined || isMultipart ? options.body : JSON.stringify(options.body),
     });
-  } catch {
-    throw new Error('API server is not reachable. Please check your internet connection and try again.');
+  } catch (error) {
+    // Surface the real failure (DNS / TLS / CORS / wrong URL) in DevTools so it
+    // can be diagnosed, instead of always blaming the connection.
+    console.error(`API request failed: ${options.method || 'GET'} ${state.apiUrl}${path}`, error);
+    throw new Error(`API server is not reachable (${error?.message || 'network error'}). Tried ${state.apiUrl}${path} — check the API URL in Settings and your connection.`);
   }
 
   const payload = await response.json().catch(() => ({}));
@@ -476,6 +492,9 @@ async function conversationKey(conversationId, version) {
 }
 
 function encryptionContext(conversationId, version) {
+  // IMPORTANT: this AAD prefix is a cross-client protocol constant shared with
+  // the mobile app and existing stored ciphertext. It must stay "pitbconnect"
+  // regardless of the app's display name, or messages fail to decrypt.
   return textEncoder.encode(`pitbconnect:${conversationId}:${version}`);
 }
 
@@ -627,8 +646,9 @@ async function fetchAttachmentBlob(conversationId, message) {
       `${state.apiUrl}/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/attachment`,
       { headers: { Accept: 'application/octet-stream', Authorization: `Bearer ${state.token}` } },
     );
-  } catch {
-    throw new Error('API server is not reachable. Please check your internet connection and try again.');
+  } catch (error) {
+    console.error(`Attachment fetch failed: ${state.apiUrl}/conversations/${conversationId}/messages/${messageId}/attachment`, error);
+    throw new Error(`API server is not reachable (${error?.message || 'network error'}). Please check your connection and try again.`);
   }
 
   if (!response.ok) {
@@ -781,13 +801,59 @@ function persistSession(payload) {
   localStorage.setItem(USER_KEY, JSON.stringify(payload.user));
 }
 
+const PASSWORD_EYE_SVGS = `
+  <svg class="password-eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18"/><path d="M10.6 10.6a2 2 0 0 0 2.8 2.8"/><path d="M9.9 5.2A10.7 10.7 0 0 1 12 5c6.4 0 10 7 10 7a15.7 15.7 0 0 1-3.1 3.9"/><path d="M6.2 6.2C3.5 8 2 12 2 12s3.6 7 10 7a10.5 10.5 0 0 0 4-.8"/></svg>
+  <svg class="password-eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>`;
+
+function showAuthForgot() {
+  const verifying = state.forgotStage === 'verify';
+  return `
+    <section class="auth-screen">
+      <div class="auth-card">
+        <section class="auth-content">
+          <div class="brand-lockup"><span class="brand-mark">${BRAND_LOGO}</span><span>DailyConnect</span></div>
+          <h2>Reset password</h2>
+          ${verifying ? `
+          <p class="auth-hint">We sent a 6-digit code to ${state.forgotEmailHint
+            ? `<strong>${escapeHtml(state.forgotEmailHint)}</strong>`
+            : 'the email on file for this number'}. Enter it below with your new password. The code expires in 15 minutes.</p>
+          <form id="reset-password-form" class="form-grid">
+            <input type="hidden" name="phone" value="${escapeHtml(state.forgotPhone)}" />
+            <div class="field"><label for="reset-code">Reset code</label><input id="reset-code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="6-digit code" title="Enter the 6-digit code from the email" required /></div>
+            <div class="field">
+              <label for="reset-password">New password</label>
+              <div class="password-input-wrap">
+                <input id="reset-password" name="password" type="password" autocomplete="new-password" minlength="8" maxlength="128" placeholder="At least 8 characters" required />
+                <button class="password-visibility" type="button" data-action="toggle-field-visibility" data-target="reset-password" aria-label="Show password" title="Show password" aria-pressed="false">${PASSWORD_EYE_SVGS}</button>
+              </div>
+            </div>
+            <button class="primary-button auth-submit" type="submit">Set new password</button>
+          </form>
+          <p class="switch-auth"><button class="text-button" type="button" data-action="forgot-resend">Didn’t get a code? Send again</button></p>
+          ` : `
+          <p class="auth-hint">Enter your phone number and we’ll email a reset code to the address on your account.</p>
+          <form id="forgot-password-form" class="form-grid">
+            <div class="field"><label for="forgot-phone">Phone number</label><input id="forgot-phone" name="phone" type="tel" autocomplete="tel" inputmode="tel" pattern="\\+[1-9][0-9]{7,14}" value="${escapeHtml(state.forgotPhone)}" placeholder="+15551234567" title="Use international format, for example +15551234567" required /></div>
+            <button class="primary-button auth-submit" type="submit">Send reset code</button>
+          </form>
+          `}
+          <p class="switch-auth">Remembered it? <button class="text-button" type="button" data-action="back-to-login">Back to sign in</button></p>
+        </section>
+      </div>
+    </section>`;
+}
+
 function showAuth() {
+  if (state.authMode === 'forgot') {
+    app.innerHTML = showAuthForgot();
+    return;
+  }
   const isSignup = state.authMode === 'signup';
   app.innerHTML = `
     <section class="auth-screen">
       <div class="auth-card">
         <section class="auth-content">
-          <div class="brand-lockup"><span class="brand-mark">P</span><span>PITBConnect</span></div>
+          <div class="brand-lockup"><span class="brand-mark">${BRAND_LOGO}</span><span>DailyConnect</span></div>
           <h2>${isSignup ? 'Create account' : 'Sign in'}</h2>
           <form id="auth-form" class="form-grid">
             ${isSignup ? `
@@ -802,12 +868,10 @@ function showAuth() {
               <label for="password">Password</label>
               <div class="password-input-wrap">
                 <input id="password" name="password" type="password" autocomplete="${isSignup ? 'new-password' : 'current-password'}" minlength="${isSignup ? 8 : 1}" maxlength="128" placeholder="${isSignup ? 'At least 8 characters' : 'Your password'}" required />
-                <button class="password-visibility" type="button" data-action="toggle-password-visibility" aria-label="Show password" title="Show password" aria-pressed="false">
-                  <svg class="password-eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18"/><path d="M10.6 10.6a2 2 0 0 0 2.8 2.8"/><path d="M9.9 5.2A10.7 10.7 0 0 1 12 5c6.4 0 10 7 10 7a15.7 15.7 0 0 1-3.1 3.9"/><path d="M6.2 6.2C3.5 8 2 12 2 12s3.6 7 10 7a10.5 10.5 0 0 0 4-.8"/></svg>
-                  <svg class="password-eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>
-                </button>
+                <button class="password-visibility" type="button" data-action="toggle-password-visibility" aria-label="Show password" title="Show password" aria-pressed="false">${PASSWORD_EYE_SVGS}</button>
               </div>
             </div>
+            ${isSignup ? '' : '<p class="auth-forgot"><button class="text-button" type="button" data-action="forgot-password">Forgot password?</button></p>'}
             <button class="primary-button auth-submit" type="submit">${isSignup ? 'Create account' : 'Sign in'}</button>
           </form>
           <p class="switch-auth">
@@ -822,7 +886,7 @@ function showAuth() {
 function updateControls() {
   return `
     <div class="update-controls">
-      <span class="app-version" id="app-version">${state.appVersion ? `PITBConnect v${escapeHtml(state.appVersion)}` : 'PITBConnect'}</span>
+      <span class="app-version" id="app-version">${state.appVersion ? `DailyConnect v${escapeHtml(state.appVersion)}` : 'DailyConnect'}</span>
       <div class="update-actions">
         <button class="small-button" type="button" data-action="check-updates">Check for updates</button>
         <button class="small-button update-download" type="button" data-action="download-update" ${state.updateAvailableVersion ? '' : 'hidden'}>Download v${escapeHtml(state.updateAvailableVersion || '')}</button>
@@ -932,7 +996,7 @@ function showChatShell() {
     <div class="app-shell ${state.selectedConversationId ? 'chat-open' : ''}">
       <nav class="app-nav" aria-label="Main navigation">
         <div class="app-nav-primary">
-          <span class="app-nav-brand brand-mark" aria-label="PITBConnect">P</span>
+          <span class="app-nav-brand brand-mark" aria-label="DailyConnect">${BRAND_LOGO}</span>
           <button class="app-nav-button" type="button" data-action="show-friends" aria-label="Chats" title="Chats">${navIcon('chats')}</button>
           <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="search" aria-label="Search" aria-expanded="false" title="Search">${navIcon('search')}</button>
           <button class="app-nav-button" type="button" data-action="toggle-sidebar-tool" data-tool="add" aria-label="Add a friend" aria-expanded="false" title="Add a friend">${navIcon('addFriend')}</button>
@@ -1111,6 +1175,7 @@ function renderSidebarTool() {
             <strong>${escapeHtml(state.user.name)}</strong>
             <span>${escapeHtml(state.user.phone || '')}</span>
             <span class="settings-profile-actions">
+              <button class="small-button" type="button" data-action="edit-name">Edit name</button>
               <button class="small-button" type="button" data-action="choose-profile-picture">${state.user.avatar_url ? 'Change profile picture' : 'Add profile picture'}</button>
               ${state.user.avatar_url ? '<button class="secondary-button" type="button" data-action="remove-profile-picture">Remove</button>' : ''}
             </span>
@@ -1143,6 +1208,13 @@ function renderSidebarTool() {
             ${MESSAGE_EDIT_MINUTE_OPTIONS.map((minutes) => `<option value="${minutes}" ${minutes === messageEditMinutes() ? 'selected' : ''}>${minutes === 0 ? 'Off' : `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`}</option>`).join('')}
           </select>
         </label>
+        <div class="setting-row">
+          <span class="setting-text">
+            <strong>Password</strong>
+            <span>Change the password you use to sign in. You’ll need your current password.</span>
+          </span>
+          <button class="small-button" type="button" data-action="change-password">Change password</button>
+        </div>
         <p class="setting-note">Notification and blur settings are saved on this computer.</p>
       </section>`;
   }
@@ -1325,6 +1397,61 @@ function renderProfileModal() {
         <input id="profile-picture-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
       </section>
     </div>`;
+}
+
+function renderEditNameModal() {
+  const modalRoot = document.querySelector('#modal-root');
+  if (!modalRoot || !state.user) return;
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <section class="app-modal" role="dialog" aria-modal="true" aria-labelledby="edit-name-title">
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Close">×</button>
+        <h2 id="edit-name-title">Edit name</h2>
+        <p class="modal-subtitle">This is the name your contacts see.</p>
+        <form id="edit-name-form" class="form-grid">
+          <div class="field"><label for="edit-name-input">Display name</label><input id="edit-name-input" name="name" autocomplete="name" maxlength="120" value="${escapeHtml(state.user.name || '')}" placeholder="Your name" required /></div>
+          <div class="modal-actions">
+            <button class="secondary-button" type="button" data-action="close-modal">Cancel</button>
+            <button class="primary-button" type="submit">Save</button>
+          </div>
+        </form>
+      </section>
+    </div>`;
+  document.querySelector('#edit-name-input')?.focus();
+}
+
+function renderChangePasswordModal() {
+  const modalRoot = document.querySelector('#modal-root');
+  if (!modalRoot || !state.user) return;
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <section class="app-modal" role="dialog" aria-modal="true" aria-labelledby="change-password-title">
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Close">×</button>
+        <h2 id="change-password-title">Change password</h2>
+        <p class="modal-subtitle">Other signed-in devices will be signed out. This device stays signed in.</p>
+        <form id="change-password-form" class="form-grid">
+          <div class="field">
+            <label for="current-password">Current password</label>
+            <div class="password-input-wrap">
+              <input id="current-password" name="current_password" type="password" autocomplete="current-password" maxlength="128" placeholder="Your current password" required />
+              <button class="password-visibility" type="button" data-action="toggle-field-visibility" data-target="current-password" aria-label="Show password" title="Show password" aria-pressed="false">${PASSWORD_EYE_SVGS}</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="new-password">New password</label>
+            <div class="password-input-wrap">
+              <input id="new-password" name="password" type="password" autocomplete="new-password" minlength="8" maxlength="128" placeholder="At least 8 characters" required />
+              <button class="password-visibility" type="button" data-action="toggle-field-visibility" data-target="new-password" aria-label="Show password" title="Show password" aria-pressed="false">${PASSWORD_EYE_SVGS}</button>
+            </div>
+          </div>
+          <div class="modal-actions">
+            <button class="secondary-button" type="button" data-action="close-modal">Cancel</button>
+            <button class="primary-button" type="submit">Update password</button>
+          </div>
+        </form>
+      </section>
+    </div>`;
+  document.querySelector('#current-password')?.focus();
 }
 
 function renderUserProfileModal(user) {
@@ -2255,7 +2382,7 @@ function handleReadPush(payload) {
 // ---------------------------------------------------------------------------
 
 function missedCallSeenKey() {
-  return `pitbconnect.lastSeenMissedCall.${state.user?.id}`;
+  return `dailyconnect.lastSeenMissedCall.${state.user?.id}`;
 }
 
 function updateMissedCallBadge(count) {
@@ -3127,6 +3254,34 @@ function closeImagePreview() {
   app.querySelector('.image-viewer')?.remove();
 }
 
+// Renders the red unread badge overlaid on the Windows taskbar icon.
+// Returns a PNG data URL, or null when there is nothing to show.
+function renderTaskbarBadge(count) {
+  if (!Number.isSafeInteger(count) || count < 1) return null;
+  const size = 32;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const label = count > 99 ? '99+' : String(count);
+
+  ctx.fillStyle = '#e5362f';
+  ctx.beginPath();
+  ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const fontSize = label.length >= 3 ? 14 : label.length === 2 ? 17 : 21;
+  ctx.font = `600 ${fontSize}px "Segoe UI", system-ui, sans-serif`;
+  ctx.fillText(label, size / 2, size / 2 + 1);
+
+  return canvas.toDataURL('image/png');
+}
+
 function syncUnreadIndicators() {
   const unreadCount = state.conversations.reduce((total, conversation) => {
     const count = Number(conversation.unread_count);
@@ -3154,8 +3309,8 @@ function syncUnreadIndicators() {
     othersLabel.title = `${othersUnread} unread from people who are not your friends`;
     othersLabel.hidden = othersUnread === 0;
   }
-  document.title = unreadCount ? `(${unreadCount}) PITBConnect — Messages` : 'PITBConnect — Messages';
-  window.desktopApp?.setUnreadCount(unreadCount, shouldNotify);
+  document.title = unreadCount ? `(${unreadCount}) DailyConnect — Messages` : 'DailyConnect — Messages';
+  window.desktopApp?.setUnreadCount(unreadCount, shouldNotify, renderTaskbarBadge(unreadCount));
 }
 
 // Shows a desktop notification for each conversation whose unread count grew
@@ -4266,7 +4421,7 @@ async function openGroupConversation(conversationId) {
 async function handleAuthSubmit(form) {
   const formData = new FormData(form);
   const body = Object.fromEntries(formData.entries());
-  body.device_name = 'pitbconnect-desktop';
+  body.device_name = 'dailyconnect-desktop';
   const path = state.authMode === 'signup' ? '/auth/register' : '/auth/login';
   const submitButton = form.querySelector('button[type="submit"]');
   submitButton.disabled = true;
@@ -4281,6 +4436,86 @@ async function handleAuthSubmit(form) {
     startPolling();
   } finally {
     submitButton.disabled = false;
+  }
+}
+
+async function handleEditName(form) {
+  const name = new FormData(form).get('name')?.toString().trim() || '';
+  if (!name) throw new Error('Enter your name.');
+  if (name === state.user?.name) {
+    closeModal();
+    return;
+  }
+  const submit = form.querySelector('button[type="submit"]');
+  if (submit) submit.disabled = true;
+  try {
+    const payload = await api('/user/profile', { method: 'PATCH', body: { name } });
+    storeUser({ ...state.user, ...payload.user });
+    closeModal();
+    render();
+    showNotice('Your name has been updated.', 'success');
+  } finally {
+    if (submit) submit.disabled = false;
+  }
+}
+
+async function handleChangePassword(form) {
+  const formData = new FormData(form);
+  const currentPassword = formData.get('current_password')?.toString() || '';
+  const newPassword = formData.get('password')?.toString() || '';
+  if (newPassword.length < 8) throw new Error('Your new password must be at least 8 characters.');
+  if (newPassword === currentPassword) throw new Error('Choose a password different from your current one.');
+  const submit = form.querySelector('button[type="submit"]');
+  if (submit) submit.disabled = true;
+  try {
+    await api('/user/password', {
+      method: 'PATCH',
+      body: { current_password: currentPassword, password: newPassword },
+    });
+    closeModal();
+    showNotice('Your password has been changed.', 'success');
+  } finally {
+    if (submit) submit.disabled = false;
+  }
+}
+
+async function handleForgotRequest(form) {
+  const phone = new FormData(form).get('phone')?.toString().trim() || '';
+  if (!phone) throw new Error('Enter your phone number.');
+  const submit = form.querySelector('button[type="submit"]');
+  if (submit) submit.disabled = true;
+  try {
+    const payload = await api('/auth/forgot-password', { method: 'POST', body: { phone } });
+    state.forgotPhone = phone;
+    state.forgotEmailHint = payload?.email_hint || '';
+    state.forgotStage = 'verify';
+    render();
+    showNotice(payload?.message || 'If that number has an account, a reset code is on its way.', 'success');
+  } finally {
+    if (submit) submit.disabled = false;
+  }
+}
+
+async function handleResetPassword(form) {
+  const formData = new FormData(form);
+  const body = {
+    phone: formData.get('phone')?.toString().trim() || state.forgotPhone,
+    code: formData.get('code')?.toString().trim() || '',
+    password: formData.get('password')?.toString() || '',
+  };
+  if (!/^[0-9]{6}$/.test(body.code)) throw new Error('Enter the 6-digit code from the email.');
+  if (body.password.length < 8) throw new Error('Your new password must be at least 8 characters.');
+  const submit = form.querySelector('button[type="submit"]');
+  if (submit) submit.disabled = true;
+  try {
+    const payload = await api('/auth/reset-password', { method: 'POST', body });
+    state.authMode = 'login';
+    state.forgotStage = 'request';
+    state.forgotEmailHint = '';
+    render();
+    showNotice(payload?.message || 'Your password has been reset. Sign in with your new password.', 'success');
+  } finally {
+    if (submit) submit.disabled = false;
   }
 }
 
@@ -4772,7 +5007,7 @@ function pastedImageFile(clipboardData) {
     throw new Error('This pasted image format is not supported. Save it as PNG or JPEG and try again.');
   }
 
-  return new File([image], `PITBConnect-snippet-${Date.now()}.${extension}`, {
+  return new File([image], `DailyConnect-snippet-${Date.now()}.${extension}`, {
     type: image.type,
     lastModified: Date.now(),
   });
@@ -4914,7 +5149,7 @@ async function logout() {
 
 function renderUpdateStatus() {
   const version = document.querySelector('#app-version');
-  if (version && state.appVersion) version.textContent = `PITBConnect v${state.appVersion}`;
+  if (version && state.appVersion) version.textContent = `DailyConnect v${state.appVersion}`;
   const status = document.querySelector('#update-status');
   if (status) status.textContent = state.updateStatus;
   document.querySelectorAll('[data-action="check-updates"]').forEach((button) => {
@@ -4952,6 +5187,10 @@ app.addEventListener('submit', async (event) => {
   const form = event.target;
   try {
     if (form.id === 'auth-form') await handleAuthSubmit(form);
+    if (form.id === 'forgot-password-form') await handleForgotRequest(form);
+    if (form.id === 'reset-password-form') await handleResetPassword(form);
+    if (form.id === 'edit-name-form') await handleEditName(form);
+    if (form.id === 'change-password-form') await handleChangePassword(form);
     if (form.id === 'api-settings-form') {
       const value = normalizeApiUrl(new FormData(form).get('apiUrl')?.toString() || '');
       const parsed = new URL(value);
@@ -5022,6 +5261,34 @@ app.addEventListener('click', async (event) => {
       button.setAttribute('aria-pressed', String(visible));
       button.classList.toggle('is-visible', visible);
       password.focus();
+    } else if (action === 'toggle-field-visibility') {
+      const field = document.querySelector(`#${button.dataset.target}`);
+      if (field) {
+        const visible = field.type === 'password';
+        field.type = visible ? 'text' : 'password';
+        button.setAttribute('aria-label', visible ? 'Hide password' : 'Show password');
+        button.setAttribute('title', visible ? 'Hide password' : 'Show password');
+        button.setAttribute('aria-pressed', String(visible));
+        button.classList.toggle('is-visible', visible);
+        field.focus();
+      }
+    } else if (action === 'forgot-password') {
+      state.authMode = 'forgot';
+      state.forgotStage = 'request';
+      state.forgotEmailHint = '';
+      render();
+    } else if (action === 'forgot-resend') {
+      state.forgotStage = 'request';
+      render();
+    } else if (action === 'back-to-login') {
+      state.authMode = 'login';
+      state.forgotStage = 'request';
+      state.forgotEmailHint = '';
+      render();
+    } else if (action === 'edit-name') {
+      renderEditNameModal();
+    } else if (action === 'change-password') {
+      renderChangePasswordModal();
     } else if (action === 'toggle-auth') {
       state.authMode = state.authMode === 'login' ? 'signup' : 'login';
       render();
@@ -5139,7 +5406,7 @@ app.addEventListener('click', async (event) => {
     } else if (action === 'test-notification') {
       const shown = await window.desktopApp?.testNotification?.();
       showNotice(shown
-        ? 'Test notification sent. If it did not appear, open Windows Settings > System > Notifications, make sure PITBConnect is allowed, and turn off Do not disturb.'
+        ? 'Test notification sent. If it did not appear, open Windows Settings > System > Notifications, make sure DailyConnect is allowed, and turn off Do not disturb.'
         : 'This computer does not support desktop notifications.', shown ? 'success' : 'error');
     } else if (action === 'open-create-group') {
       renderCreateGroupModal();
@@ -5426,6 +5693,9 @@ window.addEventListener('focus', () => {
   }).catch(() => {});
 });
 
+// Log the resolved endpoints at startup so a wrong (e.g. stale) API URL is
+// obvious in DevTools when login fails. Open with Ctrl+Shift+I to see it.
+console.info(`[DailyConnect] API base: ${state.apiUrl} | Socket: ${state.socketUrl}`);
 applySettings();
 window.desktopApp?.onOpenConversation?.((conversationId) => {
   void openConversationById(conversationId).catch((error) =>

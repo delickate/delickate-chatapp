@@ -84,7 +84,7 @@ contextBridge.exposeInMainWorld('localAttachments', {
 });
 
 contextBridge.exposeInMainWorld('desktopApp', {
-  setUnreadCount: (count, notify) => ipcRenderer.send('chat:unread-count', { count, notify }),
+  setUnreadCount: (count, notify, badge) => ipcRenderer.send('chat:unread-count', { count, notify, badge }),
   showNotification: (notification) => ipcRenderer.send('desktop:notify', notification),
   testNotification: () => ipcRenderer.invoke('desktop:test-notification'),
   onOpenConversation: (callback) => {
