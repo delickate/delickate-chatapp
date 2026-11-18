@@ -1278,10 +1278,10 @@ function renderFriendList(filterValue = state.sidebarTool === 'search' ? state.f
         ? `You: ${preview}`
         : preview;
       return `
-        <div class="friend-item ${String(selectedConversation()?.friend?.id) === String(friend.id) ? 'active' : ''} ${unreadCount ? 'has-unread' : ''}">
+        <div class="friend-item ${String(selectedConversation()?.friend?.id) === String(friend.id) ? 'active' : ''} ${unreadCount ? 'has-unread' : ''}" data-action="open-friend" data-id="${escapeHtml(friend.id)}" title="Open chat with ${escapeHtml(friend.name)}">
           ${userProfileButton(friend, 'sm', true)}
           <div class="person-info friend-item-main">
-            <button class="user-profile-name" type="button" data-action="open-user-profile" data-id="${escapeHtml(friend.id)}">${escapeHtml(friend.name)}</button>${conversationTag(conversation)}
+            <button class="user-profile-name" type="button" data-action="open-friend" data-id="${escapeHtml(friend.id)}">${escapeHtml(friend.name)}</button>${conversationTag(conversation)}
             <button class="conversation-preview friend-item-open-chat" type="button" data-action="open-friend" data-id="${escapeHtml(friend.id)}">${escapeHtml(previewText)}</button>
           </div>
           <div class="conversation-meta">${lastMessage ? formattedTime(lastMessage.created_at) : ''}
@@ -1346,10 +1346,13 @@ function renderThread() {
         <button class="icon-button" type="button" data-action="block-user" data-id="${escapeHtml(conversation.friend?.id)}" title="Block user" aria-label="Block ${escapeHtml(conversation.friend?.name || 'user')}" ${conversation.type === 'group' ? 'hidden' : ''}>⊘</button>
         <button class="icon-button" type="button" data-action="call-audio" title="${conversation.type === 'group' ? 'Start group voice call' : 'Start voice call'}" aria-label="${conversation.type === 'group' ? 'Start group voice call' : 'Start voice call'}" ${state.joinedRoomId ? '' : 'disabled'}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.2 3.8 9.5 3.3a1.6 1.6 0 0 1 1.8 1.1l.8 2.8a1.6 1.6 0 0 1-.7 1.8l-1.6 1.1a14 14 0 0 0 4.1 4.1l1.1-1.6a1.6 1.6 0 0 1 1.8-.7l2.8.8a1.6 1.6 0 0 1 1.1 1.8l-.5 2.3a2 2 0 0 1-2 1.6A15.5 15.5 0 0 1 5.6 5.8a2 2 0 0 1 1.6-2Z"/></svg></button>
         <button class="icon-button" type="button" data-action="call-video" title="${conversation.type === 'group' ? 'Start group video call' : 'Start video call'}" aria-label="${conversation.type === 'group' ? 'Start group video call' : 'Start video call'}" ${state.joinedRoomId ? '' : 'disabled'}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="12" height="12" rx="2"/><path d="m15 10 6-3v10l-6-3z"/></svg></button>
+        <button class="icon-button disappearing-button${conversation.disappearing_seconds ? ' active' : ''}" type="button" data-action="disappearing-settings" title="${conversation.disappearing_seconds ? `Disappearing messages: ${disappearingLabel(conversation.disappearing_seconds)}` : 'Disappearing messages: Off'}" aria-label="Disappearing messages settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/></svg></button>
+        <button class="icon-button" type="button" data-action="export-chat" title="Export chat to a file" aria-label="Export this chat to a file"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 17v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2"/></svg></button>
         <button class="icon-button" type="button" data-action="clear-chat" title="Clear chat (only for you)" aria-label="Clear chat for you"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg></button>
         <button class="icon-button" type="button" data-action="refresh" title="Refresh messages" aria-label="Refresh messages">↻</button>
       </div>
     </header>
+    ${conversation.disappearing_seconds ? `<div class="disappearing-note"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/></svg><span>New messages disappear ${escapeHtml(disappearingLabel(conversation.disappearing_seconds).toLowerCase())} after they're sent.</span></div>` : ''}
     <div class="chat-search" id="chat-search" hidden></div>
     <div class="pinned-bar" id="pinned-bar" hidden></div>
     <div class="message-list" id="message-list"></div>
@@ -1452,6 +1455,47 @@ function renderChangePasswordModal() {
       </section>
     </div>`;
   document.querySelector('#current-password')?.focus();
+}
+
+function renderDisappearingModal(conversation) {
+  const modalRoot = document.querySelector('#modal-root');
+  if (!modalRoot || !conversation) return;
+  const current = Number(conversation.disappearing_seconds) || 0;
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <section class="app-modal" role="dialog" aria-modal="true" aria-labelledby="disappearing-title">
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Close">×</button>
+        <h2 id="disappearing-title">Disappearing messages</h2>
+        <p class="modal-subtitle">When on, new messages in this chat disappear for everyone after the chosen time. Messages already sent are not affected. This applies to everyone in the chat.</p>
+        <div class="disappearing-options" role="radiogroup" aria-label="Disappearing timer">
+          ${DISAPPEARING_OPTIONS.map(([seconds, label]) => `
+            <button type="button" class="disappearing-option${seconds === current ? ' selected' : ''}" role="radio" aria-checked="${seconds === current}" data-action="set-disappearing" data-id="${escapeHtml(conversation.id)}" data-seconds="${seconds}">
+              <span>${escapeHtml(label)}</span>
+              ${seconds === current ? '<span class="disappearing-check" aria-hidden="true">✓</span>' : ''}
+            </button>`).join('')}
+        </div>
+      </section>
+    </div>`;
+}
+
+async function setDisappearing(conversationId, seconds) {
+  const updated = await api(`/conversations/${encodeURIComponent(conversationId)}/disappearing`, {
+    method: 'PATCH',
+    body: { seconds: Number(seconds) },
+  });
+  const nextSeconds = Number(updated?.disappearing_seconds) || 0;
+  state.conversations = state.conversations.map((item) =>
+    String(item.id) === String(conversationId)
+      ? { ...item, disappearing_seconds: nextSeconds }
+      : item);
+  closeModal();
+  if (String(state.selectedConversationId) === String(conversationId)) {
+    renderThread();
+    renderMessages();
+  }
+  showNotice(nextSeconds > 0
+    ? `Disappearing messages set to ${disappearingLabel(nextSeconds)}.`
+    : 'Disappearing messages turned off.', 'success');
 }
 
 function renderUserProfileModal(user) {
@@ -2013,6 +2057,143 @@ async function fetchSearchPage(conversationId, beforeId) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Chat export
+//
+// Pulls the whole conversation (paginating oldest-ward), decrypts it here in the
+// renderer, and builds a human-readable transcript. The main process then opens
+// a native Save dialog and writes the .txt or .html the person picks.
+// ---------------------------------------------------------------------------
+const EXPORT_PAGE_SIZE = 100;
+const EXPORT_MAX_MESSAGES = 50000;
+
+async function fetchAllMessagesForExport(conversationId) {
+  const byId = new Map();
+  let beforeId = null;
+  for (let page = 0; page < EXPORT_MAX_MESSAGES / EXPORT_PAGE_SIZE + 1; page += 1) {
+    const query = beforeId
+      ? `before_id=${beforeId}&limit=${EXPORT_PAGE_SIZE}`
+      : `limit=${EXPORT_PAGE_SIZE}`;
+    const payload = await api(`/conversations/${encodeURIComponent(conversationId)}/messages?${query}`);
+    const batch = await decryptMessagesForDisplay(
+      conversationId,
+      Array.isArray(payload.data) ? payload.data : [],
+    );
+    if (!batch.length) break;
+    for (const message of batch) byId.set(String(message.id), message);
+    const ids = batch.map((message) => Number(message.id)).filter(Number.isFinite);
+    const oldest = ids.length ? Math.min(...ids) : null;
+    if (!payload.has_more || !oldest || byId.size >= EXPORT_MAX_MESSAGES) break;
+    beforeId = oldest;
+  }
+  return [...byId.values()].sort((left, right) => Number(left.id) - Number(right.id));
+}
+
+function exportSenderName(message) {
+  const name = message.sender?.name || 'Unknown';
+  return String(message.sender?.id) === String(state.user?.id) ? `${name} (you)` : name;
+}
+
+function exportMessageBody(message) {
+  if (message.deleted_for_everyone_at) return '[message deleted]';
+  if (message.unavailable) return '[message unavailable]';
+  if (message.decryption_failed || message.body === UNDECRYPTABLE_TEXT) return '[could not be decrypted]';
+  if (message.type === 'call' || message.type === 'voice') return `[${messagePreview(message)}]`;
+  if (message.type === 'protected') return '[protected message]';
+  const parts = [];
+  if (message.attachment?.name) {
+    const isImage = String(message.attachment.mime || '').startsWith('image/');
+    parts.push(`[${isImage ? 'image' : 'file'}: ${message.attachment.name}]`);
+  }
+  if (message.body) parts.push(message.body);
+  return parts.join(' ') || '[empty message]';
+}
+
+function exportDayLabel(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? ''
+    : date.toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+}
+
+function exportTimeLabel(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? ''
+    : date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
+
+function buildChatExportText(conversation, messages) {
+  const lines = [`Chat export: ${conversationTitle(conversation)}`];
+  if (conversation.type === 'group') {
+    lines.push(`Group · ${(conversation.participants || []).length} members`);
+  }
+  lines.push(`${messages.length} message${messages.length === 1 ? '' : 's'}`);
+  lines.push(`Exported ${new Date().toLocaleString()} from DailyConnect`);
+  lines.push('='.repeat(50));
+  let lastDay = '';
+  for (const message of messages) {
+    const day = exportDayLabel(message.created_at);
+    if (day && day !== lastDay) {
+      lines.push('', `— ${day} —`);
+      lastDay = day;
+    }
+    lines.push(`[${exportTimeLabel(message.created_at)}] ${exportSenderName(message)}: ${exportMessageBody(message)}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
+function buildChatExportHtml(conversation, messages) {
+  const title = conversationTitle(conversation);
+  const subtitle = `${conversation.type === 'group' ? `Group · ${(conversation.participants || []).length} members · ` : ''}`
+    + `${messages.length} message${messages.length === 1 ? '' : 's'} · Exported ${new Date().toLocaleString()} from DailyConnect`;
+  const rows = [];
+  let lastDay = '';
+  for (const message of messages) {
+    const day = exportDayLabel(message.created_at);
+    if (day && day !== lastDay) {
+      rows.push(`<div class="day">${escapeHtml(day)}</div>`);
+      lastDay = day;
+    }
+    const mine = String(message.sender?.id) === String(state.user?.id);
+    rows.push(`<div class="msg${mine ? ' me' : ''}"><div class="meta"><span class="who">${escapeHtml(exportSenderName(message))}</span><span class="time">${escapeHtml(exportTimeLabel(message.created_at))}</span></div><div class="body">${escapeHtml(exportMessageBody(message))}</div></div>`);
+  }
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(title)} — chat export</title><style>`
+    + 'body{font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#f4f7fb;color:#1b2430;margin:0;padding:24px;}'
+    + '.wrap{max-width:760px;margin:0 auto;}h1{font-size:20px;margin:0 0 4px;}'
+    + '.sub{color:#64748b;font-size:13px;margin:0 0 20px;}'
+    + '.day{text-align:center;color:#64748b;font-size:12px;margin:18px 0 10px;}'
+    + '.msg{background:#fff;border-radius:12px;padding:10px 12px;margin:6px 0;box-shadow:0 1px 2px rgba(0,0,0,.05);}'
+    + '.msg.me{background:#e6f1fc;}'
+    + '.meta{display:flex;justify-content:space-between;gap:12px;font-size:12px;color:#64748b;margin-bottom:2px;}'
+    + '.who{font-weight:700;color:#1b5b9b;}.body{white-space:pre-wrap;word-break:break-word;font-size:14px;}'
+    + `</style></head><body><div class="wrap"><h1>${escapeHtml(title)}</h1><p class="sub">${escapeHtml(subtitle)}</p>${rows.join('')}</div></body></html>`;
+}
+
+async function exportChat() {
+  const conversation = selectedConversation();
+  if (!conversation) return;
+  if (!window.desktopApp?.exportChat) {
+    showNotice('Chat export is only available in the desktop app.');
+    return;
+  }
+  showNotice('Preparing chat export…');
+  const messages = await fetchAllMessagesForExport(conversation.id);
+  if (!messages.length) {
+    showNotice('There are no messages to export in this chat.');
+    return;
+  }
+  const defaultName = `${conversationTitle(conversation)} chat export`;
+  const result = await window.desktopApp.exportChat({
+    defaultName,
+    text: buildChatExportText(conversation, messages),
+    html: buildChatExportHtml(conversation, messages),
+  });
+  if (result?.saved) showNotice(`Chat exported to ${result.filePath}`, 'success');
+  else showNotice('Chat export canceled.');
+}
+
 // Brings a chat's index up to date (new messages first), then indexes older
 // history until `limit` messages were scanned or the chat's start is reached.
 // Runs are queued per chat and can stop early; the next run resumes.
@@ -2487,9 +2668,36 @@ function seenByMarkup(cursors, alignEnd) {
     </div>`;
 }
 
+// Disappearing messages: a per-chat timer set on the conversation. New messages
+// carry an `expires_at`; once it passes they are removed from view (and the API
+// deletes them on its next fetch/sweep). These must match the API's options.
+const DISAPPEARING_OPTIONS = [
+  [0, 'Off'],
+  [3600, '1 hour'],
+  [86400, '24 hours'],
+  [604800, '7 days'],
+  [7776000, '90 days'],
+];
+
+function disappearingLabel(seconds) {
+  const match = DISAPPEARING_OPTIONS.find(([value]) => value === Number(seconds));
+  return match ? match[1] : 'Off';
+}
+
+function isMessageExpired(message) {
+  return Boolean(message?.expires_at) && Date.parse(message.expires_at) <= Date.now();
+}
+
+function pruneExpiredMessages() {
+  const before = state.messages.length;
+  state.messages = state.messages.filter((message) => !isMessageExpired(message));
+  return state.messages.length !== before;
+}
+
 function renderMessages() {
   const list = document.querySelector('#message-list');
   if (!list) return;
+  pruneExpiredMessages();
   const wasNearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
   if (!state.messages.length) {
     list.innerHTML = state.messagesLoading
@@ -5362,6 +5570,12 @@ app.addEventListener('click', async (event) => {
       await refreshData();
     } else if (action === 'clear-chat') {
       await handleClearChat();
+    } else if (action === 'export-chat') {
+      await exportChat();
+    } else if (action === 'disappearing-settings') {
+      renderDisappearingModal(selectedConversation());
+    } else if (action === 'set-disappearing') {
+      await setDisappearing(id, button.dataset.seconds);
     } else if (action === 'message-by-phone') {
       const input = document.querySelector('#friend-phone');
       const phone = input?.value.trim();
@@ -5703,6 +5917,11 @@ window.desktopApp?.onOpenConversation?.((conversationId) => {
 });
 window.chatSocket?.onEvent(handleSocketEvent);
 checkForUpdates(false);
+
+// Disappearing messages leave the view as their timers pass, without a refresh.
+setInterval(() => {
+  if (state.selectedConversationId && pruneExpiredMessages()) renderMessages();
+}, 15000);
 
 if (state.token && state.user) {
   void api('/user').then((user) => {

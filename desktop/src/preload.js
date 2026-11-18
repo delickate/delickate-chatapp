@@ -95,6 +95,7 @@ contextBridge.exposeInMainWorld('desktopApp', {
   },
   openExternal: (url) => ipcRenderer.invoke('desktop:open-external', url),
   copyText: (text) => ipcRenderer.invoke('desktop:copy-text', text),
+  exportChat: (payload) => ipcRenderer.invoke('chat:export-save', payload),
   checkForUpdates: () => ipcRenderer.invoke('desktop:check-updates'),
   downloadUpdate: (version) => ipcRenderer.invoke('desktop:download-update', version),
 });

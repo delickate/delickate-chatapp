@@ -575,6 +575,41 @@ ipcMain.handle('chat:attachment-delete', async (event, { userId, conversationId,
   await fs.rm(filePath, { force: true });
 });
 
+// Exports a chat transcript the renderer has already assembled (and decrypted).
+// Opens a native Save dialog; the chosen extension (.txt or .html) picks format.
+const EXPORT_MAX_BYTES = 32 * 1024 * 1024;
+ipcMain.handle('chat:export-save', async (event, { defaultName, text, html } = {}) => {
+  if (!isMainWindowEvent(event)) {
+    throw new Error('Chat export is only available to the app window.');
+  }
+  const hasText = typeof text === 'string';
+  const hasHtml = typeof html === 'string';
+  if (!hasText && !hasHtml) {
+    throw new Error('There is nothing to export.');
+  }
+  if ((hasText && text.length > EXPORT_MAX_BYTES) || (hasHtml && html.length > EXPORT_MAX_BYTES)) {
+    throw new Error('This conversation is too large to export.');
+  }
+
+  const base = String(defaultName || 'chat-export')
+    .replace(/[^a-z0-9 _-]/gi, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'chat-export';
+  const filters = [];
+  if (hasText) filters.push({ name: 'Text file', extensions: ['txt'] });
+  if (hasHtml) filters.push({ name: 'Web page', extensions: ['html'] });
+
+  const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+    title: 'Export chat',
+    defaultPath: `${base}.${hasText ? 'txt' : 'html'}`,
+    filters,
+  });
+  if (canceled || !filePath) return { saved: false };
+
+  const wantsHtml = path.extname(filePath).toLowerCase() === '.html' && hasHtml;
+  const content = wantsHtml ? html : (hasText ? text : html);
+  await fs.writeFile(filePath, content, 'utf8');
+  return { saved: true, filePath };
+});
+
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (require('electron-squirrel-startup')) {
   app.quit();

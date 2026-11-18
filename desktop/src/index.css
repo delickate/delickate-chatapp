@@ -230,7 +230,9 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .request-actions button { display: grid; place-items: center; width: 25px; height: 25px; padding: 0; border: 0; border-radius: 8px; color: var(--green); background: var(--green-soft); font-size: 13px; }
 .request-actions button.reject { color: #a36c67; background: #fbefed; }
 .friend-list { flex: 1 1 0; min-height: 0; align-content: start; padding-bottom: 14px; background: #fff; }
-.friend-item { display: flex; align-items: center; gap: 11px; width: 100%; min-height: 72px; padding: 10px; border: 0; border-radius: 14px; background: #fff; text-align: left; align-self: start; }
+.friend-item { display: flex; align-items: center; gap: 11px; width: 100%; min-height: 72px; padding: 10px; border: 0; border-radius: 14px; background: #fff; text-align: left; align-self: start; cursor: pointer; }
+/* The avatar opens the profile, so give it its own affordance distinct from the row. */
+.friend-item .user-profile-trigger { cursor: pointer; }
 .friend-item:hover { background: rgba(40, 120, 199, .055); }
 .friend-item.active { background: linear-gradient(90deg, rgba(40,120,199,.11), rgba(40,120,199,.045)); box-shadow: inset 0 0 0 1px rgba(40,120,199,.13); }
 .friend-item.has-unread:not(.active) { background: rgba(230,241,252,.85); }
@@ -250,9 +252,12 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .group-member-role { padding: 3px 7px; border-radius: 999px; color: var(--green-dark); background: #edf5fc; font-size: 10px; font-weight: 700; }
 .group-member-remove { display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; color: #983f3f; background: #fdf1f1; font-size: 14px; cursor: pointer; }
 .group-member-remove:hover { background: #fde8e8; }
-.group-members-button { display: flex; align-items: center; justify-content: center; gap: 5px; width: auto; min-width: 52px; padding: 0 7px; }
+.group-members-button { position: relative; overflow: visible; gap: 0; padding: 0; }
 .group-members-button svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
-.group-members-button .group-member-count { min-width: 20px; height: 20px; padding: 0 5px; }
+/* Member count sits as a badge on the top-right corner of the people icon.
+   Uses a neutral slate colour (not the blue/red of unread counters) so it reads
+   as an informational member count, never as an unread-message alert. */
+.group-members-button .group-member-count { position: absolute; top: -5px; right: -5px; min-width: 16px; height: 16px; padding: 0 4px; border: 2px solid #fff; border-radius: 8px; color: #fff; background: #94a3b8; font-size: 9px; font-weight: 700; line-height: 1; }
 .small-button.danger { color: #b75d5d; background: #fef1f0; }
 .modal-backdrop { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 20px; background: rgba(24, 39, 35, .38); backdrop-filter: blur(3px); }
 .app-modal { position: relative; width: min(100%, 420px); max-height: min(640px, calc(100vh - 40px)); overflow: auto; padding: 26px; border: 1px solid rgba(223, 233, 228, .9); border-radius: 18px; background: #fff; box-shadow: 0 24px 70px rgba(22, 43, 36, .2); }
@@ -626,6 +631,16 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 
 /* Group header: member count next to the name */
 .member-count-chip { display: inline-flex; align-items: center; margin-left: 6px; padding: 2px 8px; border-radius: 999px; color: var(--green-dark); background: var(--green-soft); font-size: 11px; font-weight: 700; vertical-align: middle; white-space: nowrap; }
+
+/* Disappearing messages */
+.disappearing-button.active { color: var(--green); background: var(--green-soft); }
+.disappearing-note { display: flex; align-items: center; gap: 8px; padding: 7px 16px; color: var(--muted); background: #f3f7fb; border-bottom: 1px solid var(--line); font-size: 12px; }
+.disappearing-note svg { width: 15px; height: 15px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.disappearing-options { display: grid; gap: 6px; margin-top: 6px; }
+.disappearing-option { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--ink); font-size: 14px; font-weight: 600; text-align: left; cursor: pointer; }
+.disappearing-option:hover { background: #f3f7fb; }
+.disappearing-option.selected { border-color: var(--green); background: var(--green-soft); color: var(--green-dark); }
+.disappearing-check { color: var(--green); font-weight: 800; }
 
 /* Chat list tags: message requests and blocked chats */
 .chat-tag { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 999px; color: #5d6b78; background: #edf1f5; font-size: 10px; font-weight: 700; vertical-align: middle; }
