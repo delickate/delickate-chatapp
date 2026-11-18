@@ -104,6 +104,8 @@ const state = {
   replyTarget: null,
   editTarget: null,
   selectedAttachment: null,
+  // One-shot per-message self-destruct timer (seconds) for the next message sent.
+  messageExpirySeconds: 0,
   previewImageUrl: null,
   cachedAttachments: new Map(),
   attachmentCachePending: new Set(),
@@ -754,6 +756,7 @@ function clearSession() {
   state.messages = [];
   state.replyTarget = null;
   state.selectedAttachment = null;
+  state.messageExpirySeconds = 0;
   clearAttachmentPreview();
   state.cachedAttachments.clear();
   state.attachmentCachePending.clear();
@@ -1360,6 +1363,7 @@ function renderThread() {
       <div class="chat-banner" id="chat-banner" role="status" hidden></div>
       <div class="attachment-preview" id="attachment-preview" aria-live="polite" hidden></div>
       <div class="reply-preview" id="reply-preview" hidden></div>
+      <div class="message-timer-preview" id="message-timer-preview" role="status" ${state.messageExpirySeconds ? '' : 'hidden'}>${state.messageExpirySeconds ? `<span>⏱ This message disappears ${escapeHtml(messageTimerLabel(state.messageExpirySeconds).toLowerCase())} after it's sent.</span><button type="button" class="text-button" data-action="clear-message-timer">Cancel</button>` : ''}</div>
       <div class="voice-recorder" id="voice-recorder" role="group" aria-label="Recording a voice message" hidden></div>
       <form class="composer" id="message-form">
         <textarea class="compose-input" name="body" rows="1" maxlength="10000" placeholder="Write a message…" aria-label="Write a message"></textarea>
@@ -1369,6 +1373,7 @@ function renderThread() {
           `).join('')}
         </div>
         <button class="emoji-button" type="button" data-action="toggle-emoji-picker" aria-label="Add emoji" aria-expanded="false" aria-controls="emoji-picker" title="Add emoji">☺</button>
+        <button class="emoji-button message-timer-button${state.messageExpirySeconds ? ' active' : ''}" type="button" data-action="toggle-message-timer" aria-label="Make this message disappear after a set time" title="${state.messageExpirySeconds ? `This message disappears after ${escapeHtml(messageTimerLabel(state.messageExpirySeconds))}` : 'Make this message disappear after a set time'}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/></svg></button>
         <input id="attachment-input" type="file" accept="image/*,.pdf,.txt,.rtf,.doc,.dot,.docx,.docm,.dotx,.dotm,.odt,.ppt,.pot,.pps,.pptx,.pptm,.ppsx,.odp,.xls,.xlt,.xlsx,.xlsm,.xlsb,.xltx,.xltm,.csv,.ods,.zip" hidden>
         <button class="attach-button" type="button" data-action="choose-attachment" aria-label="Attach a file" title="Attach a file">＋</button>
         <button class="mic-button" type="button" data-action="open-protected-composer" aria-label="Send a password-protected message" title="Send a password-protected message"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3M12 14.5v2"/></svg></button>
@@ -2682,6 +2687,73 @@ const DISAPPEARING_OPTIONS = [
 function disappearingLabel(seconds) {
   const match = DISAPPEARING_OPTIONS.find(([value]) => value === Number(seconds));
   return match ? match[1] : 'Off';
+}
+
+// Per-message self-destruct timer options (sender-chosen, one message at a time).
+// Must match the API's MESSAGE_EXPIRY_SECONDS_OPTIONS.
+const MESSAGE_TIMER_OPTIONS = [
+  [0, 'Off'],
+  [60, '1 minute'],
+  [300, '5 minutes'],
+  [900, '15 minutes'],
+  [3600, '1 hour'],
+  [28800, '8 hours'],
+  [86400, '24 hours'],
+];
+
+function messageTimerLabel(seconds) {
+  const match = MESSAGE_TIMER_OPTIONS.find(([value]) => value === Number(seconds));
+  return match ? match[1] : 'Off';
+}
+
+function updateMessageTimerUI() {
+  const armed = Number(state.messageExpirySeconds) > 0;
+  const button = document.querySelector('.message-timer-button');
+  if (button) {
+    button.classList.toggle('active', armed);
+    button.title = armed
+      ? `This message disappears after ${messageTimerLabel(state.messageExpirySeconds)}`
+      : 'Make this message disappear after a set time';
+  }
+  const preview = document.querySelector('#message-timer-preview');
+  if (preview) {
+    preview.hidden = !armed;
+    preview.innerHTML = armed
+      ? `<span>⏱ This message disappears ${escapeHtml(messageTimerLabel(state.messageExpirySeconds).toLowerCase())} after it's sent.</span><button type="button" class="text-button" data-action="clear-message-timer">Cancel</button>`
+      : '';
+  }
+}
+
+function renderMessageTimerModal() {
+  const modalRoot = document.querySelector('#modal-root');
+  if (!modalRoot) return;
+  const current = Number(state.messageExpirySeconds) || 0;
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <section class="app-modal" role="dialog" aria-modal="true" aria-labelledby="message-timer-title">
+        <button class="modal-close" type="button" data-action="close-modal" aria-label="Close">×</button>
+        <h2 id="message-timer-title">Disappearing message</h2>
+        <p class="modal-subtitle">The next message you send will disappear for everyone after this time. This applies to just that one message.</p>
+        <div class="disappearing-options" role="radiogroup" aria-label="Message timer">
+          ${MESSAGE_TIMER_OPTIONS.map(([seconds, label]) => `
+            <button type="button" class="disappearing-option${seconds === current ? ' selected' : ''}" role="radio" aria-checked="${seconds === current}" data-action="set-message-timer" data-seconds="${seconds}">
+              <span>${escapeHtml(label)}</span>
+              ${seconds === current ? '<span class="disappearing-check" aria-hidden="true">✓</span>' : ''}
+            </button>`).join('')}
+        </div>
+      </section>
+    </div>`;
+}
+
+function setMessageTimer(seconds) {
+  state.messageExpirySeconds = Number(seconds) || 0;
+  closeModal();
+  updateMessageTimerUI();
+}
+
+function clearMessageTimer() {
+  state.messageExpirySeconds = 0;
+  updateMessageTimerUI();
 }
 
 function isMessageExpired(message) {
@@ -4582,6 +4654,7 @@ async function openFriend(friendId) {
   state.messages = [];
   state.replyTarget = null;
   state.selectedAttachment = null;
+  state.messageExpirySeconds = 0;
   clearAttachmentPreview();
   state.hasOlderMessages = false;
   state.messagesLoading = true;
@@ -4613,6 +4686,7 @@ async function openGroupConversation(conversationId) {
   state.messages = [];
   state.replyTarget = null;
   state.selectedAttachment = null;
+  state.messageExpirySeconds = 0;
   clearAttachmentPreview();
   state.hasOlderMessages = false;
   state.messagesLoading = true;
@@ -4918,6 +4992,7 @@ async function handleSendMessage(form) {
   const conversation = selectedConversation();
   const file = state.selectedAttachment;
   const replyTarget = state.replyTarget;
+  const expirySeconds = Number(state.messageExpirySeconds) || 0;
   if (!conversation || (!body && !file)) return;
   if (file && !isAllowedAttachment(file)) {
     throw new Error('Choose an image, document, spreadsheet, or ZIP file.');
@@ -4952,6 +5027,7 @@ async function handleSendMessage(form) {
         payload.append('key_version', String(encrypted.key_version));
         payload.append('attachment', new Blob([encryptedFile.data], { type: 'application/octet-stream' }), 'encrypted.bin');
         if (replyTarget) payload.append('reply_to_message_id', replyTarget.id);
+        if (expirySeconds > 0) payload.append('disappearing_seconds', String(expirySeconds));
         return api(`/conversations/${encodeURIComponent(conversation.id)}/messages`, { method: 'POST', body: payload });
       },
     ));
@@ -4962,6 +5038,8 @@ async function handleSendMessage(form) {
     const attachmentInput = form.querySelector('#attachment-input');
     if (attachmentInput) attachmentInput.value = '';
     clearAttachmentPreview();
+    state.messageExpirySeconds = 0;
+    updateMessageTimerUI();
     if (CACHED_IMAGE_TYPES.has(sentMessage.attachment?.mime)) {
       try {
         const key = attachmentCacheKey(conversation.id, sentMessage.id);
@@ -4988,6 +5066,7 @@ async function handleSendMessage(form) {
 // Text messages appear immediately with a "sending" clock and are confirmed in
 // place when the server responds. Sends are queued so they arrive in order.
 async function sendTextMessage(conversation, body, replyTarget) {
+  const expirySeconds = Number(state.messageExpirySeconds) || 0;
   const tempId = `pending-${crypto.randomUUID()}`;
   const pendingMessage = {
     id: tempId,
@@ -4996,6 +5075,7 @@ async function sendTextMessage(conversation, body, replyTarget) {
     sender: { id: state.user.id, name: state.user.name, avatar_url: state.user.avatar_url },
     body,
     type: 'text',
+    expires_at: expirySeconds > 0 ? new Date(Date.now() + expirySeconds * 1000).toISOString() : null,
     reply_to: replyTarget ? {
       id: replyTarget.id,
       sender: { id: replyTarget.sender?.id, name: replyTarget.sender?.name },
@@ -5018,14 +5098,20 @@ async function sendTextMessage(conversation, body, replyTarget) {
   if (field) field.value = '';
   state.replyTarget = null;
   updateReplyPreview();
+  state.messageExpirySeconds = 0;
+  updateMessageTimerUI();
   showOutgoingChanges(conversation.id, true);
 
   const request = state.sendQueue.then(() =>
-    sendEncrypted(conversation.id, { text: body }, (encrypted) =>
-      api(`/conversations/${encodeURIComponent(conversation.id)}/messages`, {
+    sendEncrypted(conversation.id, { text: body }, (encrypted) => {
+      const payload = { ...encrypted };
+      if (replyTarget) payload.reply_to_message_id = replyTarget.id;
+      if (expirySeconds > 0) payload.disappearing_seconds = expirySeconds;
+      return api(`/conversations/${encodeURIComponent(conversation.id)}/messages`, {
         method: 'POST',
-        body: replyTarget ? { ...encrypted, reply_to_message_id: replyTarget.id } : encrypted,
-      })));
+        body: payload,
+      });
+    }));
   state.sendQueue = request.catch(() => {});
 
   let sentMessage;
@@ -5576,6 +5662,12 @@ app.addEventListener('click', async (event) => {
       renderDisappearingModal(selectedConversation());
     } else if (action === 'set-disappearing') {
       await setDisappearing(id, button.dataset.seconds);
+    } else if (action === 'toggle-message-timer') {
+      renderMessageTimerModal();
+    } else if (action === 'set-message-timer') {
+      setMessageTimer(button.dataset.seconds);
+    } else if (action === 'clear-message-timer') {
+      clearMessageTimer();
     } else if (action === 'message-by-phone') {
       const input = document.querySelector('#friend-phone');
       const phone = input?.value.trim();

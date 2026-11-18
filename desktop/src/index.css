@@ -641,6 +641,9 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .disappearing-option:hover { background: #f3f7fb; }
 .disappearing-option.selected { border-color: var(--green); background: var(--green-soft); color: var(--green-dark); }
 .disappearing-check { color: var(--green); font-weight: 800; }
+.message-timer-button.active { color: var(--green); }
+.message-timer-preview { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 12px; margin: 0 4px 6px; border-radius: 10px; color: var(--green-dark); background: var(--green-soft); font-size: 12px; }
+.message-timer-preview[hidden] { display: none; }
 
 /* Chat list tags: message requests and blocked chats */
 .chat-tag { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 999px; color: #5d6b78; background: #edf1f5; font-size: 10px; font-weight: 700; vertical-align: middle; }
