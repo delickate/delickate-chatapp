@@ -1,5 +1,6 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, session, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, session, shell, Tray } = require('electron');
 const fs = require('node:fs/promises');
+const fsSync = require('node:fs');
 const path = require('node:path');
 const { io } = require('socket.io-client');
 const { version: APP_VERSION } = require('../package.json');
@@ -127,6 +128,75 @@ const CALL_CLIENT_EVENTS = new Set([
 ]);
 let mainWindow;
 let socketClient;
+let tray = null;
+let isQuitting = false;
+let trayBalloonShown = false;
+
+// Running in the tray keeps the socket alive so message notifications still
+// arrive after the window is closed. These prefs live in a small file in the
+// user-data dir (the renderer's localStorage isn't reachable from here).
+function trayPrefsPath() {
+  return path.join(app.getPath('userData'), 'tray-prefs.json');
+}
+function closeToTrayEnabled() {
+  try {
+    return JSON.parse(fsSync.readFileSync(trayPrefsPath(), 'utf8')).closeToTray !== false;
+  } catch {
+    return true; // default: keep running in the tray
+  }
+}
+function setCloseToTray(value) {
+  try {
+    fsSync.writeFileSync(trayPrefsPath(), JSON.stringify({ closeToTray: Boolean(value) }));
+  } catch (error) {
+    console.error('Could not save tray preference:', error);
+  }
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function buildTrayMenu() {
+  return Menu.buildFromTemplate([
+    { label: 'Open DailyConnect', click: () => showMainWindow() },
+    { type: 'separator' },
+    {
+      label: 'Keep running in the tray when closed',
+      type: 'checkbox',
+      checked: closeToTrayEnabled(),
+      click: (item) => setCloseToTray(item.checked),
+    },
+    {
+      label: 'Start with Windows',
+      type: 'checkbox',
+      checked: app.getLoginItemSettings().openAtLogin,
+      click: (item) => app.setLoginItemSettings({
+        openAtLogin: item.checked,
+        args: ['--hidden'],
+      }),
+    },
+    { type: 'separator' },
+    { label: 'Quit DailyConnect', click: () => { isQuitting = true; app.quit(); } },
+  ]);
+}
+
+function createTray() {
+  if (tray) return;
+  const iconPath = path.join(__dirname, 'assets', 'icon.ico');
+  const image = nativeImage.createFromPath(iconPath);
+  tray = new Tray(image.isEmpty() ? iconPath : image);
+  tray.setToolTip('DailyConnect');
+  tray.setContextMenu(buildTrayMenu());
+  tray.on('click', () => showMainWindow());
+  tray.on('double-click', () => showMainWindow());
+}
 
 function parseVersion(value) {
   const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(value ?? '').trim());
@@ -623,6 +693,9 @@ const createWindow = () => {
     minHeight: 620,
     backgroundColor: '#f4f7f6',
     autoHideMenuBar: true,
+    // Launched at login with --hidden: start in the tray (still connects and
+    // shows notifications), so Windows startup isn't interrupted by the window.
+    show: !process.argv.includes('--hidden'),
     // Window / taskbar icon while running unpackaged (npm run start). Packaged
     // builds get their icon embedded in the .exe via packagerConfig.icon.
     icon: path.join(__dirname, 'assets', 'icon.ico'),
@@ -639,6 +712,21 @@ const createWindow = () => {
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.on('focus', () => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.flashFrame(false);
+  });
+  // Closing the window hides it to the tray (so notifications keep coming)
+  // unless the user is really quitting or has turned that preference off.
+  mainWindow.on('close', (event) => {
+    if (!isQuitting && closeToTrayEnabled()) {
+      event.preventDefault();
+      mainWindow.hide();
+      if (!trayBalloonShown && process.platform === 'win32' && tray) {
+        trayBalloonShown = true;
+        tray.displayBalloon({
+          title: 'DailyConnect is still running',
+          content: 'It stays in the tray so you keep getting message notifications. Right-click the tray icon to quit.',
+        });
+      }
+    }
   });
   mainWindow.on('closed', () => {
     mainWindow = null;
@@ -685,6 +773,7 @@ app.whenReady().then(() => {
     requestMediaPermission().then((granted) => callback(granted)).catch(() => callback(false));
   });
   createWindow();
+  createTray();
 
   // On OS X it's common to re-create a window in the app when the
   // dock icon is clicked and there are no other windows open.
@@ -699,13 +788,21 @@ app.whenReady().then(() => {
 // for applications and their menu bar to stay active until the user quits
 // explicitly with Cmd + Q.
 app.on('window-all-closed', () => {
+  // Stay alive in the tray (socket connected) when the user only closed the
+  // window and tray-running is on; otherwise quit as usual.
+  if (!isQuitting && closeToTrayEnabled()) {
+    return;
+  }
   disconnectSocket();
   if (process.platform !== 'darwin') {
     app.quit();
   }
 });
 
-app.on('before-quit', disconnectSocket);
+app.on('before-quit', () => {
+  isQuitting = true;
+  disconnectSocket();
+});
 
 // In this file you can include the rest of your app's specific main process
 // code. You can also put them in separate files and import them here.
