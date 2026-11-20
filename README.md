@@ -1,2 +1,3 @@
-# delickate-chatapp
-delickate chatapp
+# PITBConnect
+
+PITBConnect messaging app.

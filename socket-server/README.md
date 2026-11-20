@@ -35,9 +35,12 @@ desktop client's **Socket.IO URL** as `http://127.0.0.1:3001`. Set
 Use HTTPS for both deployed services. Set browser origins to the exact
 production origins; native desktop connections without an Origin header are
 supported. Every connection still requires a valid Sanctum bearer token.
-Set the TURN variables to your relay credentials to improve call connectivity.
-The server sends ICE configuration only to authenticated, call-capable sockets.
-Use short-lived TURN credentials where your relay supports them.
+Calls between different networks generally need a TURN relay; the default public
+STUN server alone cannot relay media when either network blocks direct
+peer-to-peer traffic. Configure `TURN_SERVER_URLS`, `TURN_SERVER_USERNAME`, and
+`TURN_SERVER_CREDENTIAL` on the deployed socket server, then restart it. Use
+short-lived credentials where your relay supports them. The server sends its ICE
+configuration only to authenticated, call-capable sockets.
 
 ## Socket events
 
@@ -63,13 +66,26 @@ Use short-lived TURN credentials where your relay supports them.
   between the two authenticated call participants. `call:cancel` and
   `call:end` release call state. Invitations expire after 30 seconds. Call
   signaling is ephemeral and does not store media or call history.
+- Group calls use a mesh (one WebRTC connection per pair of participants, up to
+  8 people) and separate `group-call:*` events, so one-to-one clients are
+  unaffected. Clients opt in with `call:ready` `{ enabled: true, group_calls: true }`.
+  `group-call:start` `{ call_id, conversation_id, media_type }` is verified
+  against Laravel's group membership and rings every member with
+  `group-call:invite`; starting in a group that already has a call joins it
+  instead. Members answer with `group-call:join` (or `group-call:decline`) and
+  receive `group-call:joined` with the current participants; the joiner offers
+  to each of them through `group-call:signal` `{ call_id, to_user_id, signal }`,
+  which is delivered with `from_user_id`. `group-call:leave` (or a disconnect)
+  removes a participant. The call ends when one person is left after it
+  connected, or after 45 seconds with nobody answering, and every member
+  receives `group-call:ended` with a missed/completed summary. A user in a group
+  call is busy for one-to-one calls.
 - The server responds to enabled clients with `call:config` and its
   `{ ice_servers }` list, built from the STUN/TURN environment settings.
-- WebRTC media is peer-to-peer. Clients use a public STUN server for basic
-  connectivity; configure `TURN_SERVER_URLS`, `TURN_SERVER_USERNAME`, and
-  `TURN_SERVER_CREDENTIAL` for networks that block direct peer connections.
-  Deploy the service over HTTPS/WSS; browsers require a secure context for
-  microphone/camera access.
+- WebRTC media is peer-to-peer when possible and uses the configured TURN relay
+  when direct connectivity is blocked. STUN-only setup is not sufficient for
+  many combinations of office, mobile, and home networks. Deploy the service
+  over HTTPS/WSS; browsers require a secure context for microphone/camera access.
 - `GET /health` returns `{"status":"ok"}`.
 
 Typing and presence are ephemeral in-memory socket state; they are not stored

@@ -61,7 +61,11 @@ function mockLaravelFetch({ deniedConversationId, mismatchedPeerConversationId }
       const peerId = conversationId === mismatchedPeerConversationId
         ? 3
         : userId === 1 ? 2 : 1;
-      return Response.json({ conversation_id: conversationId, peer_id: peerId });
+      return Response.json({
+        conversation_id: conversationId,
+        peer_id: peerId,
+        participant_ids: [userId, peerId]
+      });
     }
 
     return Response.json({ message: "Not found." }, { status: 404 });
@@ -143,6 +147,22 @@ test("socket clients can ping and receive a timestamped pong", async () => {
   }
 });
 
+test("new message notifications reach all authorized conversation participants", async () => {
+  const baseUrl = await startTestServer();
+  const sender = await connectClient(baseUrl, 1);
+  const recipient = await connectClient(baseUrl, 2);
+
+  try {
+    const notification = waitForEvent(recipient, "conversation:message");
+    sender.emit("conversation:message", { conversation_id: 42, message_id: 108 });
+
+    assert.deepEqual(await notification, { conversation_id: 42, message_id: 108 });
+  } finally {
+    sender.close();
+    recipient.close();
+  }
+});
+
 test("call invites cannot target a friend outside the selected conversation", async () => {
   const baseUrl = await startTestServer({
     fetchImpl: mockLaravelFetch({ mismatchedPeerConversationId: 42 })
@@ -198,13 +218,13 @@ test("configuration rejects malformed origins and ports", () => {
   assert.deepEqual(getIceServers({
     stunUrls: "stun:stun.example.test:3478",
     turnUrls: "turn:relay.example.test:3478,turns:relay.example.test:5349",
-    turnUsername: "daylight",
+    turnUsername: "pitbconnect-test-user",
     turnCredential: "secret"
   }), [
     { urls: "stun:stun.example.test:3478" },
     {
       urls: ["turn:relay.example.test:3478", "turns:relay.example.test:5349"],
-      username: "daylight",
+      username: "pitbconnect-test-user",
       credential: "secret"
     }
   ]);
@@ -383,9 +403,86 @@ test("friends can establish an authorized one-to-one call and relay WebRTC signa
       signal: { type: "offer", sdp: "test-sdp" }
     });
 
+    caller.emit("call:connected", { call_id: "test-call-id-123456" });
     const ended = waitForEvent(callee, "call:ended");
     caller.emit("call:end", { call_id: "test-call-id-123456" });
-    assert.deepEqual(await ended, { call_id: "test-call-id-123456" });
+    const endedPayload = await ended;
+    assert.equal(endedPayload.call_id, "test-call-id-123456");
+    assert.equal(endedPayload.conversation_id, 42);
+    assert.equal(endedPayload.caller_id, 1);
+    assert.equal(endedPayload.media_type, "video");
+    assert.equal(endedPayload.call_status, "completed");
+    assert.equal(Number.isInteger(endedPayload.duration_seconds), true);
+  } finally {
+    caller.close();
+    callee.close();
+  }
+});
+
+test("declined calls are reported as missed call summaries", async () => {
+  const baseUrl = await startTestServer();
+  const caller = await connectClient(baseUrl, 1);
+  const callee = await connectClient(baseUrl, 2);
+
+  try {
+    callee.emit("call:ready", { enabled: true });
+    const joined = waitForEvent(caller, "conversation:joined");
+    caller.emit("conversation:join", { conversation_id: 42 });
+    await joined;
+
+    const invite = waitForEvent(callee, "call:invite");
+    caller.emit("call:invite", {
+      call_id: "test-call-id-987654",
+      conversation_id: 42,
+      target_user_id: 2,
+      media_type: "audio"
+    });
+    await invite;
+
+    const missed = waitForEvent(caller, "call:rejected");
+    callee.emit("call:reject", { call_id: "test-call-id-987654" });
+    const missedPayload = await missed;
+    assert.equal(missedPayload.call_id, "test-call-id-987654");
+    assert.equal(missedPayload.call_status, "missed");
+    assert.equal(missedPayload.conversation_id, 42);
+    assert.equal(missedPayload.caller_id, 1);
+    assert.equal(missedPayload.media_type, "audio");
+  } finally {
+    caller.close();
+    callee.close();
+  }
+});
+
+test("calls cancelled while ringing are reported as missed call summaries", async () => {
+  const baseUrl = await startTestServer();
+  const caller = await connectClient(baseUrl, 1);
+  const callee = await connectClient(baseUrl, 2);
+
+  try {
+    callee.emit("call:ready", { enabled: true });
+    const joined = waitForEvent(caller, "conversation:joined");
+    caller.emit("conversation:join", { conversation_id: 42 });
+    await joined;
+
+    const invite = waitForEvent(callee, "call:invite");
+    caller.emit("call:invite", {
+      call_id: "test-call-id-cancel1",
+      conversation_id: 42,
+      target_user_id: 2,
+      media_type: "video"
+    });
+    await invite;
+
+    const endedForCaller = waitForEvent(caller, "call:ended");
+    const endedForCallee = waitForEvent(callee, "call:ended");
+    caller.emit("call:cancel", { call_id: "test-call-id-cancel1" });
+    for (const payload of await Promise.all([endedForCaller, endedForCallee])) {
+      assert.equal(payload.call_id, "test-call-id-cancel1");
+      assert.equal(payload.call_status, "missed");
+      assert.equal(payload.caller_id, 1);
+      assert.equal(payload.media_type, "video");
+      assert.equal(payload.duration_seconds, 0);
+    }
   } finally {
     caller.close();
     callee.close();
@@ -440,4 +537,239 @@ test("call signaling requires an enabled friend in the authorized conversation",
     caller.close();
     callee.close();
   }
+});
+
+const GROUP_CONVERSATION_ID = 77;
+
+function mockGroupFetch() {
+  const direct = mockLaravelFetch();
+  return async (url, options) => {
+    const token = options.headers.Authorization.replace("Bearer ", "");
+    const userId = Number(token.split("-").at(-1));
+    const pathname = new URL(url).pathname;
+
+    if (pathname.endsWith("/friends")) {
+      const friendIds = [1, 2, 3, 4].filter((id) => id !== userId);
+      return Response.json({ data: friendIds.map((id) => ({ id, name: `User ${id}` })) });
+    }
+    if (pathname.endsWith(`/conversations/${GROUP_CONVERSATION_ID}/socket-access`)) {
+      if (userId === 4) return Response.json({ message: "Not found." }, { status: 404 });
+      return Response.json({ conversation_id: GROUP_CONVERSATION_ID, peer_id: null, participant_ids: [1, 2, 3] });
+    }
+    return direct(url, options);
+  };
+}
+
+async function connectGroupClient(baseUrl, userId) {
+  const client = await connectClient(baseUrl, userId);
+  const config = waitForEvent(client, "call:config");
+  client.emit("call:ready", { enabled: true, group_calls: true });
+  await config;
+  return client;
+}
+
+test("group members can start, join, signal, and leave a mesh group call", async () => {
+  const baseUrl = await startTestServer({ fetchImpl: mockGroupFetch() });
+  const [first, second, third] = await Promise.all([1, 2, 3].map((id) => connectGroupClient(baseUrl, id)));
+  const callId = "group-call-id-123456";
+
+  try {
+    const starterJoined = waitForEvent(first, "group-call:joined");
+    const secondInvite = waitForEvent(second, "group-call:invite");
+    const thirdInvite = waitForEvent(third, "group-call:invite");
+    first.emit("group-call:start", { call_id: callId, conversation_id: GROUP_CONVERSATION_ID, media_type: "audio" });
+    assert.deepEqual(await starterJoined, {
+      call_id: callId,
+      conversation_id: GROUP_CONVERSATION_ID,
+      caller_id: 1,
+      media_type: "audio",
+      participants: []
+    });
+    const expectedInvite = {
+      call_id: callId,
+      conversation_id: GROUP_CONVERSATION_ID,
+      caller_id: 1,
+      caller_name: "User 1",
+      media_type: "audio"
+    };
+    assert.deepEqual(await secondInvite, expectedInvite);
+    assert.deepEqual(await thirdInvite, expectedInvite);
+
+    const secondJoined = waitForEvent(second, "group-call:joined");
+    const firstSawSecond = waitForEvent(first, "group-call:participant-joined");
+    second.emit("group-call:join", { call_id: callId });
+    assert.deepEqual((await secondJoined).participants, [{ user_id: 1, name: "User 1" }]);
+    assert.deepEqual(await firstSawSecond, { call_id: callId, user_id: 2, name: "User 2" });
+
+    const relayed = waitForEvent(first, "group-call:signal");
+    second.emit("group-call:signal", { call_id: callId, to_user_id: 1, signal: { description: { type: "offer", sdp: "x" } } });
+    assert.deepEqual(await relayed, {
+      call_id: callId,
+      from_user_id: 2,
+      signal: { description: { type: "offer", sdp: "x" } }
+    });
+
+    const thirdJoined = waitForEvent(third, "group-call:joined");
+    third.emit("group-call:join", { call_id: callId });
+    assert.deepEqual((await thirdJoined).participants.map((item) => item.user_id), [1, 2]);
+
+    const firstSawThirdLeave = waitForEvent(first, "group-call:participant-left");
+    third.emit("group-call:leave", { call_id: callId });
+    assert.deepEqual(await firstSawThirdLeave, { call_id: callId, user_id: 3 });
+
+    // With only one person left the call ends for every group member.
+    const endedForThird = waitForEvent(third, "group-call:ended");
+    second.emit("group-call:leave", { call_id: callId });
+    const summary = await endedForThird;
+    assert.equal(summary.call_id, callId);
+    assert.equal(summary.conversation_id, GROUP_CONVERSATION_ID);
+    assert.equal(summary.caller_id, 1);
+    assert.equal(summary.call_status, "completed");
+    assert.equal(Number.isInteger(summary.duration_seconds), true);
+  } finally {
+    first.close();
+    second.close();
+    third.close();
+  }
+});
+
+test("an unanswered group call ends as missed and non-members cannot join", async () => {
+  const baseUrl = await startTestServer({ fetchImpl: mockGroupFetch(), groupCallRingMs: 80 });
+  const [first, outsider] = await Promise.all([1, 4].map((id) => connectGroupClient(baseUrl, id)));
+  const callId = "group-call-id-654321";
+
+  try {
+    const joined = waitForEvent(first, "group-call:joined");
+    first.emit("group-call:start", { call_id: callId, conversation_id: GROUP_CONVERSATION_ID, media_type: "video" });
+    await joined;
+
+    const rejected = waitForEvent(outsider, "group-call:error");
+    outsider.emit("group-call:join", { call_id: callId });
+    assert.equal((await rejected).call_id, callId);
+
+    const ended = await waitForEvent(first, "group-call:ended");
+    assert.equal(ended.call_status, "missed");
+    assert.equal(ended.duration_seconds, 0);
+    assert.equal(ended.media_type, "video");
+  } finally {
+    first.close();
+    outsider.close();
+  }
+});
+
+test("group calls cannot be started in a direct conversation and a second start joins the running call", async () => {
+  const baseUrl = await startTestServer({ fetchImpl: mockGroupFetch() });
+  const [first, second] = await Promise.all([1, 2].map((id) => connectGroupClient(baseUrl, id)));
+
+  try {
+    const directError = waitForEvent(first, "group-call:error");
+    first.emit("group-call:start", { call_id: "group-call-direct-0001", conversation_id: 42, media_type: "audio" });
+    assert.equal((await directError).message, "Group calls are only available in group chats.");
+
+    const firstJoined = waitForEvent(first, "group-call:joined");
+    first.emit("group-call:start", { call_id: "group-call-first-00001", conversation_id: GROUP_CONVERSATION_ID, media_type: "audio" });
+    await firstJoined;
+
+    const secondJoined = waitForEvent(second, "group-call:joined");
+    second.emit("group-call:start", { call_id: "group-call-second-0001", conversation_id: GROUP_CONVERSATION_ID, media_type: "video" });
+    const running = await secondJoined;
+    assert.equal(running.call_id, "group-call-first-00001");
+    assert.equal(running.media_type, "audio");
+
+    // While in a group call the user is busy for one-to-one calls too.
+    const joinedRoom = waitForEvent(first, "conversation:joined");
+    first.emit("conversation:join", { conversation_id: 42 });
+    await joinedRoom;
+    const busy = waitForEvent(first, "call:busy");
+    first.emit("call:invite", { call_id: "direct-while-busy-0001", conversation_id: 42, target_user_id: 2, media_type: "audio" });
+    assert.equal((await busy).call_id, "direct-while-busy-0001");
+  } finally {
+    first.close();
+    second.close();
+  }
+});
+
+test("message notifications reuse a cached participant lookup instead of calling Laravel every time", async () => {
+  let accessLookups = 0;
+  const baseFetch = mockLaravelFetch();
+  const baseUrl = await startTestServer({
+    fetchImpl: async (url, options) => {
+      if (new URL(url).pathname.includes("/socket-access")) accessLookups += 1;
+      return baseFetch(url, options);
+    }
+  });
+  const sender = await connectClient(baseUrl, 1);
+  const recipient = await connectClient(baseUrl, 2);
+
+  try {
+    for (const messageId of [501, 502, 503]) {
+      const delivered = waitForEvent(recipient, "conversation:message");
+      sender.emit("conversation:message", { conversation_id: 42, message_id: messageId });
+      assert.deepEqual(await delivered, { conversation_id: 42, message_id: messageId });
+    }
+    assert.equal(accessLookups, 1);
+  } finally {
+    sender.close();
+    recipient.close();
+  }
+});
+
+test("read notifications reach conversation members with the reader's verified id", async () => {
+  const baseUrl = await startTestServer();
+  const reader = await connectClient(baseUrl, 2);
+  const sender = await connectClient(baseUrl, 1);
+
+  try {
+    const seen = waitForEvent(sender, "conversation:read");
+    reader.emit("conversation:read", { conversation_id: 42, user_id: 999 });
+    assert.deepEqual(await seen, { conversation_id: 42, user_id: 2 });
+  } finally {
+    reader.close();
+    sender.close();
+  }
+});
+
+function postJson(url, body, headers = {}) {
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(body)
+  });
+}
+
+test("the API can push events to users through the internal endpoint", async () => {
+  const secret = "test-internal-secret-0123456789";
+  const baseUrl = await startTestServer({ internalEventsSecret: secret });
+  const recipient = await connectClient(baseUrl, 2);
+  const bystander = await connectClient(baseUrl, 1);
+  let bystanderGotIt = false;
+  bystander.on("message.created", () => { bystanderGotIt = true; });
+
+  try {
+    const delivered = waitForEvent(recipient, "message.created");
+    const response = await postJson(`${baseUrl}/internal/events`, {
+      events: [{ event: "message.created", user_ids: [2], payload: { conversation_id: 42, message: { id: 7 } } }]
+    }, { Authorization: `Bearer ${secret}` });
+    assert.equal(response.status, 202);
+    assert.deepEqual(await delivered, { conversation_id: 42, message: { id: 7 } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(bystanderGotIt, false);
+
+    const wrongSecret = await postJson(`${baseUrl}/internal/events`, { events: [] }, { Authorization: "Bearer nope" });
+    assert.equal(wrongSecret.status, 401);
+
+    const badEvent = await postJson(`${baseUrl}/internal/events`, {
+      events: [{ event: "call:invite", user_ids: [2], payload: {} }]
+    }, { Authorization: `Bearer ${secret}` });
+    assert.equal(badEvent.status, 422);
+  } finally {
+    recipient.close();
+    bystander.close();
+  }
+});
+
+test("the internal endpoint is disabled when no secret is configured", async () => {
+  const baseUrl = await startTestServer({ internalEventsSecret: "" });
+  const response = await postJson(`${baseUrl}/internal/events`, { events: [] }, { Authorization: "Bearer " });
+  assert.equal(response.status, 401);
 });

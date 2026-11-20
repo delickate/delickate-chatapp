@@ -33,6 +33,10 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::get('/conversations', [ConversationController::class, 'index']);
     Route::post('/conversations', [ConversationController::class, 'store']);
+    Route::post('/groups', [ConversationController::class, 'createGroup']);
+    Route::post('/groups/{conversation}/leave', [ConversationController::class, 'leaveGroup']);
+    Route::delete('/groups/{conversation}/members/{userId}', [ConversationController::class, 'removeGroupMember'])
+        ->whereNumber('userId');
     Route::get('/conversations/{conversation}/socket-access', [ConversationController::class, 'socketAccess']);
     Route::get('/conversations/{conversation}/messages', [ConversationController::class, 'messages']);
     Route::post('/conversations/{conversation}/messages', [ConversationController::class, 'send']);

@@ -18,10 +18,17 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
         $conversations = Conversation::query()
-            ->where(fn ($query) => $query->where('low_user_id', $userId)->orWhere('high_user_id', $userId))
+            ->where(function ($query) use ($userId) {
+                $query->where(function ($direct) use ($userId) {
+                    $direct->where('type', 'direct')
+                        ->where(fn ($pair) => $pair->where('low_user_id', $userId)
+                            ->orWhere('high_user_id', $userId));
+                })->orWhereHas('participants', fn ($participants) => $participants->where('users.id', $userId));
+            })
             ->with([
                 'lowUser:id,name,phone',
                 'highUser:id,name,phone',
+                'participants:id,name,phone',
                 'messages' => fn ($query) => $query->with('sender:id,name')->latest('id')->limit(1),
             ])
             ->withCount([
@@ -63,8 +70,10 @@ class ConversationController extends Controller
         }
 
         $conversation = Conversation::firstOrCreate([
+            'type' => 'direct',
             'low_user_id' => $lowId,
             'high_user_id' => $highId,
+            'direct_key' => $lowId.':'.$highId,
         ]);
 
         $conversation->load([
@@ -80,21 +89,136 @@ class ConversationController extends Controller
         return response()->json($this->conversationData($conversation, $userId), 201);
     }
 
+    public function createGroup(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'name' => ['required', 'string', 'min:1', 'max:100'],
+            'friend_ids' => ['required', 'array', 'min:1', 'max:50'],
+            'friend_ids.*' => ['required', 'integer', 'distinct', 'exists:users,id'],
+        ]);
+        $userId = (int) $request->user()->id;
+        $friendIds = array_map('intval', $validated['friend_ids']);
+        $name = trim($validated['name']);
+
+        if ($name === '') {
+            throw ValidationException::withMessages([
+                'name' => ['Enter a group title.'],
+            ]);
+        }
+
+        if (in_array($userId, $friendIds, true)) {
+            throw ValidationException::withMessages([
+                'friend_ids' => ['You are already included in the group.'],
+            ]);
+        }
+
+        $acceptedIds = FriendRequest::query()
+            ->where('status', 'accepted')
+            ->where(function ($query) use ($userId, $friendIds) {
+                $query->where(fn ($pair) => $pair
+                    ->where('low_user_id', $userId)
+                    ->whereIn('high_user_id', $friendIds))
+                    ->orWhere(fn ($pair) => $pair
+                        ->where('high_user_id', $userId)
+                        ->whereIn('low_user_id', $friendIds));
+            })
+            ->get(['low_user_id', 'high_user_id'])
+            ->map(fn (FriendRequest $friendship) => (int) $friendship->low_user_id === $userId
+                ? (int) $friendship->high_user_id
+                : (int) $friendship->low_user_id)
+            ->all();
+
+        foreach ($friendIds as $friendId) {
+            if (! in_array($friendId, $acceptedIds, true)) {
+                throw ValidationException::withMessages([
+                    'friend_ids' => ['All group members must be accepted friends.'],
+                ]);
+            }
+        }
+
+        $conversation = DB::transaction(function () use ($name, $userId, $friendIds) {
+            $conversation = Conversation::create([
+                'type' => 'group',
+                'name' => $name,
+                'created_by' => $userId,
+                'low_user_id' => $userId,
+                'high_user_id' => $userId,
+                'direct_key' => null,
+            ]);
+            $conversation->participants()->attach(array_merge([$userId], $friendIds));
+
+            return $conversation;
+        });
+
+        $conversation->load([
+            'lowUser:id,name,phone',
+            'highUser:id,name,phone',
+            'participants:id,name,phone',
+            'messages' => fn ($query) => $query->with('sender:id,name')->latest('id')->limit(1),
+        ])->setAttribute('unread_count', 0);
+
+        return response()->json($this->conversationData($conversation, $userId), 201);
+    }
+
+    public function leaveGroup(Request $request, Conversation $conversation): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if (! $conversation->isGroup()) {
+            return response()->json(['message' => 'Group not found.'], 404);
+        }
+        if ((int) $conversation->created_by === $userId) {
+            return response()->json(['message' => 'The group creator cannot leave the group.'], 403);
+        }
+        if (! $conversation->includesUser($userId)) {
+            return response()->json(['message' => 'Group not found.'], 404);
+        }
+
+        $conversation->participants()->detach($userId);
+
+        return response()->json(['message' => 'You left the group.']);
+    }
+
+    public function removeGroupMember(Request $request, Conversation $conversation, int $userId): JsonResponse
+    {
+        $actorId = (int) $request->user()->id;
+        if (! $conversation->isGroup()) {
+            return response()->json(['message' => 'Group not found.'], 404);
+        }
+        if ((int) $conversation->created_by !== $actorId) {
+            return response()->json(['message' => 'Only the group creator can remove members.'], 403);
+        }
+        if ($userId === $actorId) {
+            throw ValidationException::withMessages([
+                'user_id' => ['The group creator cannot remove themselves.'],
+            ]);
+        }
+        if (! $conversation->includesUser($userId)) {
+            return response()->json(['message' => 'Group member not found.'], 404);
+        }
+
+        $conversation->participants()->detach($userId);
+
+        return response()->json(['message' => 'Group member removed.']);
+    }
+
     public function socketAccess(Request $request, Conversation $conversation): JsonResponse
     {
         $userId = (int) $request->user()->id;
 
-        if (! in_array($userId, [(int) $conversation->low_user_id, (int) $conversation->high_user_id], true)) {
+        if (! $conversation->includesUser($userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
 
-        $peerId = $userId === (int) $conversation->low_user_id
-            ? (int) $conversation->high_user_id
-            : (int) $conversation->low_user_id;
+        $peerId = $conversation->isGroup()
+            ? null
+            : ($userId === (int) $conversation->low_user_id
+                ? (int) $conversation->high_user_id
+                : (int) $conversation->low_user_id);
 
         return response()->json([
             'conversation_id' => $conversation->id,
             'peer_id' => $peerId,
+            'type' => $conversation->type,
         ]);
     }
 
@@ -102,15 +226,15 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
 
-        if (! in_array($userId, [(int) $conversation->low_user_id, (int) $conversation->high_user_id], true)) {
+        if (! $conversation->includesUser($userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
 
         $messages = $conversation->messages()
-            ->with('sender:id,name,phone')
+            ->with(['sender:id,name,phone', 'conversation.participants:id,name,phone'])
             ->orderByDesc('id')
             ->paginate(50);
-        $messages->getCollection()->transform(fn (Message $message) => $this->messageData($message));
+        $messages->getCollection()->transform(fn (Message $message) => $this->messageData($message, $userId));
 
         return response()->json($messages);
     }
@@ -119,13 +243,13 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
 
-        if (! in_array($userId, [(int) $conversation->low_user_id, (int) $conversation->high_user_id], true)) {
+        if (! $conversation->includesUser($userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
 
         $validated = $request->validate([
             'body' => ['required_without:attachment', 'nullable', 'string', 'max:10000'],
-            'attachment' => ['required_without:body', 'nullable', 'file', 'max:5120', 'mimes:jpg,jpeg,png,gif,webp,pdf,txt'],
+            'attachment' => ['required_without:body', 'nullable', 'file', 'max:5120'],
             'type' => ['sometimes', 'in:text'],
         ]);
 
@@ -174,7 +298,7 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
 
-        if (! in_array($userId, [(int) $conversation->low_user_id, (int) $conversation->high_user_id], true)
+        if (! $conversation->includesUser($userId)
             || (int) $message->conversation_id !== (int) $conversation->id
             || ! $message->attachment_path) {
             return response()->json(['message' => 'Attachment not found.'], 404);
@@ -204,8 +328,33 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
 
-        if (! in_array($userId, [(int) $conversation->low_user_id, (int) $conversation->high_user_id], true)) {
+        if (! $conversation->includesUser($userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
+        }
+
+        if ($conversation->isGroup()) {
+            $participant = $conversation->participants()
+                ->where('users.id', $userId)
+                ->firstOrFail();
+            $previous = $column === 'read_at'
+                ? $participant->pivot->last_read_at
+                : $participant->pivot->last_delivered_at;
+            $incoming = $conversation->messages()->where('sender_id', '!=', $userId);
+            if ($previous) {
+                $incoming->where('created_at', '>', $previous);
+            }
+            $updated = $incoming->count();
+            $now = now();
+            $conversation->participants()->updateExistingPivot($userId, [
+                ($column === 'read_at' ? 'last_read_at' : 'last_delivered_at') => $now,
+                ...($column === 'read_at' ? ['last_delivered_at' => $now] : []),
+                'updated_at' => $now,
+            ]);
+
+            return response()->json([
+                'updated_count' => $updated,
+                $column => $now->toISOString(),
+            ]);
         }
 
         if ($column === 'read_at') {
@@ -243,27 +392,71 @@ class ConversationController extends Controller
 
     private function conversationData(Conversation $conversation, int $userId): array
     {
-        $otherUser = (int) $conversation->low_user_id === $userId
-            ? $conversation->highUser
-            : $conversation->lowUser;
+        $otherUser = $conversation->isGroup()
+            ? null
+            : ((int) $conversation->low_user_id === $userId
+                ? $conversation->highUser
+                : $conversation->lowUser);
         $lastMessage = $conversation->messages->first();
+        $unreadCount = $conversation->unread_count ?? 0;
+        if ($conversation->isGroup()) {
+            $participant = $conversation->participants->firstWhere('id', $userId);
+            $unread = $conversation->messages()->where('sender_id', '!=', $userId);
+            if ($participant?->pivot?->last_read_at) {
+                $unread->where('created_at', '>', $participant->pivot->last_read_at);
+            }
+            $unreadCount = $unread->count();
+        }
 
         return [
             'id' => $conversation->id,
+            'type' => $conversation->type ?? 'direct',
+            'name' => $conversation->name,
+            'created_by' => $conversation->created_by,
             'friend' => $otherUser ? [
                 'id' => $otherUser->id,
                 'name' => $otherUser->name,
                 'phone' => $otherUser->phone,
             ] : null,
+            'participants' => $conversation->isGroup()
+                ? $conversation->participants->map(fn ($participant) => [
+                    'id' => $participant->id,
+                    'name' => $participant->name,
+                    'phone' => $participant->phone,
+                ])->values()
+                : [],
             'last_message' => $lastMessage ? $this->messageData($lastMessage) : null,
-            'unread_count' => $conversation->unread_count ?? 0,
+            'unread_count' => $unreadCount,
             'created_at' => $conversation->created_at,
             'updated_at' => $conversation->updated_at,
         ];
     }
 
-    private function messageData(Message $message): array
+    private function messageData(Message $message, ?int $userId = null): array
     {
+        $readAt = $message->read_at;
+        $deliveredAt = $message->delivered_at;
+        if ($message->conversation?->isGroup()) {
+            $participants = $message->conversation->relationLoaded('participants')
+                ? $message->conversation->participants
+                : $message->conversation->participants()->get();
+            $recipients = $participants->reject(
+                fn ($participant) => (int) $participant->id === (int) $message->sender_id
+            );
+            $allRecipientsRead = $recipients->isNotEmpty() && $recipients->every(
+                fn ($participant) => $participant->pivot->last_read_at
+                    && $message->created_at->lte($participant->pivot->last_read_at)
+            );
+
+            if ($allRecipientsRead) {
+                $readAt = $recipients
+                    ->map(fn ($participant) => $participant->pivot->last_read_at)
+                    ->max();
+            } else {
+                $readAt = null;
+            }
+        }
+
         return [
             'id' => $message->id,
             'conversation_id' => $message->conversation_id,
@@ -279,26 +472,65 @@ class ConversationController extends Controller
                 'size' => $message->attachment_size,
             ] : null,
             'created_at' => $message->created_at,
-            'delivered_at' => $message->delivered_at,
-            'read_at' => $message->read_at,
+            'delivered_at' => $deliveredAt,
+            'read_at' => $readAt,
         ];
     }
 
     private function validatedAttachment(\Illuminate\Http\UploadedFile $file): array
     {
         $extension = strtolower($file->getClientOriginalExtension());
-        $mime = $file->getMimeType();
         $allowed = [
-            'jpg' => ['image/jpeg', "\xFF\xD8\xFF"],
-            'jpeg' => ['image/jpeg', "\xFF\xD8\xFF"],
-            'png' => ['image/png', "\x89PNG\r\n\x1A\n"],
-            'gif' => ['image/gif', null],
-            'webp' => ['image/webp', null],
+            'jpg' => ['image/jpeg', IMAGETYPE_JPEG],
+            'jpeg' => ['image/jpeg', IMAGETYPE_JPEG],
+            'jpe' => ['image/jpeg', IMAGETYPE_JPEG],
+            'jfif' => ['image/jpeg', IMAGETYPE_JPEG],
+            'png' => ['image/png', IMAGETYPE_PNG],
+            'gif' => ['image/gif', IMAGETYPE_GIF],
+            'webp' => ['image/webp', IMAGETYPE_WEBP],
+            'bmp' => ['image/bmp', IMAGETYPE_BMP],
+            'dib' => ['image/bmp', IMAGETYPE_BMP],
+            'tif' => ['image/tiff', [IMAGETYPE_TIFF_II, IMAGETYPE_TIFF_MM]],
+            'tiff' => ['image/tiff', [IMAGETYPE_TIFF_II, IMAGETYPE_TIFF_MM]],
+            'ico' => ['image/vnd.microsoft.icon', IMAGETYPE_ICO],
+            'avif' => ['image/avif', IMAGETYPE_AVIF],
+            'heic' => ['image/heic', 'heif'],
+            'heif' => ['image/heif', 'heif'],
             'pdf' => ['application/pdf', '%PDF-'],
             'txt' => ['text/plain', null],
+            'rtf' => ['application/rtf', '{\\rtf'],
+            'doc' => ['application/msword', "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"],
+            'dot' => ['application/msword', "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"],
+            'docm' => ['application/vnd.ms-word.document.macroEnabled.12', "PK\x03\x04"],
+            'docx' => ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', "PK\x03\x04"],
+            'dotm' => ['application/vnd.ms-word.template.macroEnabled.12', "PK\x03\x04"],
+            'dotx' => ['application/vnd.openxmlformats-officedocument.wordprocessingml.template', "PK\x03\x04"],
+            'odt' => ['application/vnd.oasis.opendocument.text', "PK\x03\x04"],
+            'ppt' => ['application/vnd.ms-powerpoint', "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"],
+            'pot' => ['application/vnd.ms-powerpoint', "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"],
+            'pps' => ['application/vnd.ms-powerpoint', "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"],
+            'pptm' => ['application/vnd.ms-powerpoint.presentation.macroEnabled.12', "PK\x03\x04"],
+            'pptx' => ['application/vnd.openxmlformats-officedocument.presentationml.presentation', "PK\x03\x04"],
+            'ppsx' => ['application/vnd.openxmlformats-officedocument.presentationml.slideshow', "PK\x03\x04"],
+            'odp' => ['application/vnd.oasis.opendocument.presentation', "PK\x03\x04"],
+            'xls' => ['application/vnd.ms-excel', "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"],
+            'xlt' => ['application/vnd.ms-excel', "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"],
+            'xlsx' => ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', "PK\x03\x04"],
+            'xlsm' => ['application/vnd.ms-excel.sheet.macroEnabled.12', "PK\x03\x04"],
+            'xlsb' => ['application/vnd.ms-excel.sheet.binary.macroEnabled.12', "PK\x03\x04"],
+            'xltm' => ['application/vnd.ms-excel.template.macroEnabled.12', "PK\x03\x04"],
+            'xltx' => ['application/vnd.openxmlformats-officedocument.spreadsheetml.template', "PK\x03\x04"],
+            'csv' => ['text/csv', null],
+            'ods' => ['application/vnd.oasis.opendocument.spreadsheet', "PK\x03\x04"],
+            'zip' => ['application/zip', "PK\x03\x04"],
         ];
 
-        $valid = isset($allowed[$extension]) && $mime === $allowed[$extension][0];
+        if (! isset($allowed[$extension])) {
+            throw ValidationException::withMessages([
+                'attachment' => ['Only images, documents, spreadsheets, and ZIP files are allowed.'],
+            ]);
+        }
+
         $contents = file_get_contents($file->getRealPath());
 
         if ($contents === false) {
@@ -307,28 +539,23 @@ class ConversationController extends Controller
             ]);
         }
 
-        if ($valid) {
-            if (in_array($extension, ['jpg', 'jpeg', 'png'], true)) {
-                $valid = str_starts_with($contents, $allowed[$extension][1]);
-            } elseif ($extension === 'gif') {
-                $valid = (str_starts_with($contents, 'GIF87a') || str_starts_with($contents, 'GIF89a'))
-                    && $this->hasImageType($file, IMAGETYPE_GIF);
-            } elseif ($extension === 'webp') {
-                $valid = strlen($contents) >= 12
-                    && substr($contents, 0, 4) === 'RIFF'
-                    && substr($contents, 8, 4) === 'WEBP'
-                    && $this->hasImageType($file, IMAGETYPE_WEBP);
-            } elseif ($extension === 'pdf') {
-                $valid = str_starts_with($contents, $allowed[$extension][1]);
-            } elseif ($extension === 'txt') {
-                $valid = ! str_contains($contents, "\0") && preg_match('//u', $contents) === 1;
-            }
-
-            if (in_array($extension, ['jpg', 'jpeg'], true)) {
-                $valid = $valid && $this->hasImageType($file, IMAGETYPE_JPEG);
-            } elseif ($extension === 'png') {
-                $valid = $valid && $this->hasImageType($file, IMAGETYPE_PNG);
-            }
+        $imageType = $allowed[$extension][1];
+        if (is_int($imageType) || is_array($imageType)) {
+            $image = @getimagesize($file->getRealPath());
+            $valid = $image !== false
+                && in_array($image[2], (array) $imageType, true)
+                && str_starts_with($image['mime'] ?? '', 'image/');
+        } elseif ($imageType === 'heif') {
+            $brand = substr($contents, 8, 4);
+            $valid = strlen($contents) >= 12
+                && substr($contents, 4, 4) === 'ftyp'
+                && in_array($brand, ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'], true);
+        } elseif ($extension === 'txt' || $extension === 'csv') {
+            $valid = ! str_contains($contents, "\0");
+        } elseif ($extension === 'zip') {
+            $valid = str_starts_with($contents, "PK\x03\x04") || str_starts_with($contents, "PK\x05\x06");
+        } else {
+            $valid = str_starts_with($contents, $imageType);
         }
 
         if (! $valid) {
@@ -347,10 +574,4 @@ class ConversationController extends Controller
         ];
     }
 
-    private function hasImageType(\Illuminate\Http\UploadedFile $file, int $expectedType): bool
-    {
-        $image = @getimagesize($file->getRealPath());
-
-        return $image !== false && $image[2] === $expectedType;
-    }
 }
